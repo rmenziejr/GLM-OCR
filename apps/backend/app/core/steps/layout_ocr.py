@@ -93,11 +93,13 @@ async def _call_ocr_service(
     output_dir: str,
     page_size: Dict[str, Any],
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    microbatch_size: int = 4,
 ) -> Dict[str, Any]:
     """
-    调用OCR服务
+    调用OCR服务（支持微批次处理）
 
-    这里是示例实现，实际需要根据您的OCR服务来调整
+    使用微批次（microbatch）模式将多张页面图片合并为一次请求，
+    减少与OCR服务的往返次数，提升整体吞吐量。
 
     Args:
         image_files: 图片文件路径列表
@@ -105,7 +107,9 @@ async def _call_ocr_service(
         page_count: 页数
         config: OCR配置
         output_dir: 输出目录
+        page_size: 页面尺寸信息（含 width / height）
         progress_callback: 进度回调
+        microbatch_size: 每次发送给OCR服务的图片数量（默认4）
     """
 
     if progress_callback:
@@ -117,55 +121,66 @@ async def _call_ocr_service(
     page_height = page_size.get("height")
     block_idx = 1
     ref_image_paths = []
-    for i, image_file in enumerate(image_files):
-        page_num = i + 1
-        result = await cli.process_single_image(image_file, custom_url=custom_url)
-        if progress_callback:
-            progress = (i / page_count) * 100
-            await progress_callback(
-                progress, f"Processing page {page_num}/{page_count}"
-            )
-        page_blocks = []
-        for idx, block in enumerate(result):
-            block_label = block.get("label", "text")
-            block_bbox = block.get("bbox_2d", [0, 0, 0, 0])
-            block_content = block.get("content", None)
-            block_index = block_idx
-            normalized_box = vlm_bbox_convert(block_bbox, page_width, page_height)
 
-            # 如果 label 为 image，则裁剪图片并添加到 image_path 字段
-            image_path_field = None
-            if block_label == "image":
-                try:
-                    # 生成分割文件名
-                    split_filename = f"split_{page_num}_{block_idx:04d}.png"
-                    split_path = os.path.join(output_dir, split_filename)
-                    crop_image_by_bbox_to_path(image_file, normalized_box, split_path)
-                    image_path_field = split_path
-                    ref_image_paths.append(image_path_field)
-                    logger.info(f"裁剪图片块 {block_idx}: {split_filename}")
-                except Exception as e:
-                    logger.warning(f"裁剪图片块 {block_idx} 失败: {str(e)}")
+    # --- microbatch loop: send up to microbatch_size pages per request ---
+    processed = 0
+    for batch_start in range(0, len(image_files), microbatch_size):
+        batch_files = image_files[batch_start : batch_start + microbatch_size]
 
-            # 构建块信息，添加 image_path 字段
-            block_info = {
-                "layout_type": block_label,
-                "layout_box": normalized_box,
-                "content": block_content,
-                "index": block_index,
-                "image_path": image_path_field,  # 图片类型时包含裁剪后的路径
-                "page_index": page_num,
-            }
-            page_blocks.append(block_info)
-            block_idx += 1
-        # 示例：每页的OCR结果
-        pages_result.append(
-            {
-                "page_index": page_num,
-                "image_file": image_file,
-                "layout": {"blocks": page_blocks},
-            }
+        # Send the whole microbatch in a single HTTP round-trip.
+        batch_results: List[List[Dict[str, Any]]] = await cli.process_images(
+            batch_files, custom_url=custom_url
         )
+
+        for j, (image_file, result) in enumerate(zip(batch_files, batch_results)):
+            page_num = batch_start + j + 1
+            processed += 1
+
+            if progress_callback:
+                progress = (processed / page_count) * 100
+                await progress_callback(
+                    progress, f"Processing page {page_num}/{page_count}"
+                )
+
+            page_blocks = []
+            for block in result:
+                block_label = block.get("label", "text")
+                block_bbox = block.get("bbox_2d", [0, 0, 0, 0])
+                block_content = block.get("content", None)
+                block_index = block_idx
+                normalized_box = vlm_bbox_convert(block_bbox, page_width, page_height)
+
+                # 如果 label 为 image，则裁剪图片并添加到 image_path 字段
+                image_path_field = None
+                if block_label == "image":
+                    try:
+                        split_filename = f"split_{page_num}_{block_idx:04d}.png"
+                        split_path = os.path.join(output_dir, split_filename)
+                        crop_image_by_bbox_to_path(image_file, normalized_box, split_path)
+                        image_path_field = split_path
+                        ref_image_paths.append(image_path_field)
+                        logger.info(f"裁剪图片块 {block_idx}: {split_filename}")
+                    except Exception as e:
+                        logger.warning(f"裁剪图片块 {block_idx} 失败: {str(e)}")
+
+                block_info = {
+                    "layout_type": block_label,
+                    "layout_box": normalized_box,
+                    "content": block_content,
+                    "index": block_index,
+                    "image_path": image_path_field,
+                    "page_index": page_num,
+                }
+                page_blocks.append(block_info)
+                block_idx += 1
+
+            pages_result.append(
+                {
+                    "page_index": page_num,
+                    "image_file": image_file,
+                    "layout": {"blocks": page_blocks},
+                }
+            )
 
     if progress_callback:
         await progress_callback(100.0, "OCR processing completed")
