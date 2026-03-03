@@ -130,6 +130,23 @@ _batcher_stop_event = threading.Event()
 _batcher_thread: Optional[threading.Thread] = None
 
 
+def _drain_queue_on_shutdown() -> None:
+    """Drain *_request_queue* and fail all pending Futures with a shutdown error.
+
+    Called during service shutdown so that any HTTP handler already blocked on
+    ``future.result()`` unblocks immediately instead of waiting for the full
+    ``_REQUEST_TIMEOUT``.
+    """
+    shutdown_exc = RuntimeError("Service shutting down.")
+    while True:
+        try:
+            item = _request_queue.get_nowait()
+        except queue.Empty:
+            break
+        if not item.future.done():
+            item.future.set_exception(shutdown_exc)
+
+
 def _batcher_loop() -> None:
     """Background thread that drains *_request_queue* in micro-batches.
 
@@ -285,6 +302,8 @@ async def lifespan(app: FastAPI):
     if _batcher_thread is not None:
         _batcher_thread.join(timeout=5.0)
     _batcher_thread = None
+    # Fail any requests that are still queued so their callers unblock promptly.
+    _drain_queue_on_shutdown()
 
     logger.info("Shutting down layout detector …")
     _detector.stop()
@@ -372,6 +391,11 @@ def detect_layout(request: LayoutRequest):
     """
     if _detector is None:
         raise HTTPException(status_code=503, detail="Layout detector not ready.")
+
+    if _batcher_stop_event.is_set() or (
+        _batcher_thread is not None and not _batcher_thread.is_alive()
+    ):
+        raise HTTPException(status_code=503, detail="Layout service is shutting down.")
 
     pil_images: List[Image.Image] = []
     for idx, b64_str in enumerate(request.images):
