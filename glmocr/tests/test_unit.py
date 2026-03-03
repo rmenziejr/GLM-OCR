@@ -1598,3 +1598,199 @@ class TestOCRClientConnectOllama:
         assert "messages" in sent_data
         assert sent_data["model"] == "my-model"
         assert sent_data["max_tokens"] == 10
+
+
+class TestLayoutApiConfig:
+    """Tests for LayoutApiConfig and the api layout backend config wiring."""
+
+    def test_default_layout_backend_is_local(self, monkeypatch):
+        """Layout backend defaults to 'local'."""
+        from glmocr.config import load_config, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+
+        cfg = load_config()
+        assert cfg.pipeline.layout.backend == "local"
+
+    def test_layout_backend_kwarg(self, monkeypatch):
+        """layout_backend kwarg sets pipeline.layout.backend."""
+        from glmocr.config import GlmOcrConfig, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+
+        cfg = GlmOcrConfig.from_env(layout_backend="api")
+        assert cfg.pipeline.layout.backend == "api"
+
+    def test_layout_api_url_kwarg(self, monkeypatch):
+        """layout_api_url kwarg sets pipeline.layout.api.api_url."""
+        from glmocr.config import GlmOcrConfig, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+
+        cfg = GlmOcrConfig.from_env(layout_api_url="http://myhost:9000/layout")
+        assert cfg.pipeline.layout.api.api_url == "http://myhost:9000/layout"
+
+    def test_layout_api_key_kwarg(self, monkeypatch):
+        """layout_api_key kwarg sets pipeline.layout.api.api_key."""
+        from glmocr.config import GlmOcrConfig, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+
+        cfg = GlmOcrConfig.from_env(layout_api_key="mytoken")
+        assert cfg.pipeline.layout.api.api_key == "mytoken"
+
+    def test_layout_backend_env_var(self, monkeypatch):
+        """GLMOCR_LAYOUT_BACKEND env var sets pipeline.layout.backend."""
+        from glmocr.config import GlmOcrConfig, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+        monkeypatch.setenv("GLMOCR_LAYOUT_BACKEND", "api")
+
+        cfg = GlmOcrConfig.from_env()
+        assert cfg.pipeline.layout.backend == "api"
+
+    def test_layout_api_url_env_var(self, monkeypatch):
+        """GLMOCR_LAYOUT_API_URL env var sets pipeline.layout.api.api_url."""
+        from glmocr.config import GlmOcrConfig, _ENV_MAP, ENV_PREFIX
+
+        for suffix in _ENV_MAP:
+            monkeypatch.delenv(f"{ENV_PREFIX}{suffix}", raising=False)
+        monkeypatch.setattr("glmocr.config._find_dotenv", lambda: None)
+        monkeypatch.setenv("GLMOCR_LAYOUT_API_URL", "http://envhost:8010/layout")
+
+        cfg = GlmOcrConfig.from_env()
+        assert cfg.pipeline.layout.api.api_url == "http://envhost:8010/layout"
+
+
+class TestApiLayoutDetector:
+    """Tests for ApiLayoutDetector."""
+
+    def test_init(self):
+        """Can instantiate ApiLayoutDetector."""
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+
+        cfg = LayoutConfig(
+            backend="api",
+            api=LayoutApiConfig(api_url="http://localhost:8010/layout"),
+        )
+        detector = ApiLayoutDetector(cfg)
+        assert detector._api_url == "http://localhost:8010/layout"
+        assert detector._session is None
+
+    def test_start_stop(self):
+        """start() creates session; stop() closes it."""
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+
+        detector = ApiLayoutDetector(
+            LayoutConfig(api=LayoutApiConfig(api_url="http://localhost:8010/layout"))
+        )
+        detector.start()
+        assert detector._session is not None
+        detector.stop()
+        assert detector._session is None
+
+    def test_process_not_started_raises(self):
+        """process() raises RuntimeError if start() was not called."""
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+        from PIL import Image
+
+        detector = ApiLayoutDetector(
+            LayoutConfig(api=LayoutApiConfig(api_url="http://localhost:8010/layout"))
+        )
+        with pytest.raises(RuntimeError, match="not started"):
+            detector.process([Image.new("RGB", (100, 100))])
+
+    def test_process_calls_api_and_returns_results(self):
+        """process() sends base64 images and parses the JSON response."""
+        from unittest.mock import MagicMock, patch
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+        from PIL import Image
+
+        expected = [
+            [
+                {
+                    "index": 0,
+                    "label": "text",
+                    "score": 0.9,
+                    "bbox_2d": [10, 20, 100, 200],
+                    "polygon": [[10, 20], [100, 20], [100, 200], [10, 200]],
+                    "task_type": "text",
+                }
+            ]
+        ]
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"results": expected}
+        mock_resp.raise_for_status = MagicMock()
+
+        detector = ApiLayoutDetector(
+            LayoutConfig(api=LayoutApiConfig(api_url="http://localhost:8010/layout"))
+        )
+        detector.start()
+
+        with patch.object(detector._session, "post", return_value=mock_resp) as mock_post:
+            images = [Image.new("RGB", (200, 300))]
+            results = detector.process(images)
+
+        assert results == expected
+        call_kwargs = mock_post.call_args
+        payload = call_kwargs[1]["json"]
+        assert "images" in payload
+        assert len(payload["images"]) == 1  # one base64 string per image
+
+        detector.stop()
+
+    def test_process_missing_results_key_raises(self):
+        """process() raises ValueError if API response has no 'results' key."""
+        from unittest.mock import MagicMock, patch
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+        from PIL import Image
+
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"detections": []}
+        mock_resp.raise_for_status = MagicMock()
+
+        detector = ApiLayoutDetector(
+            LayoutConfig(api=LayoutApiConfig(api_url="http://localhost:8010/layout"))
+        )
+        detector.start()
+        with patch.object(detector._session, "post", return_value=mock_resp):
+            with pytest.raises(ValueError, match="'results'"):
+                detector.process([Image.new("RGB", (100, 100))])
+        detector.stop()
+
+    def test_api_key_sets_authorization_header(self):
+        """start() sets Authorization header when api_key is provided."""
+        from glmocr.layout import ApiLayoutDetector
+        from glmocr.config import LayoutConfig, LayoutApiConfig
+
+        detector = ApiLayoutDetector(
+            LayoutConfig(
+                api=LayoutApiConfig(
+                    api_url="http://localhost:8010/layout", api_key="mytoken"
+                )
+            )
+        )
+        detector.start()
+        assert detector._session.headers.get("Authorization") == "Bearer mytoken"
+        detector.stop()
+
+    def test_is_base_layout_detector(self):
+        """ApiLayoutDetector is a subclass of BaseLayoutDetector."""
+        from glmocr.layout import ApiLayoutDetector, BaseLayoutDetector
+
+        assert issubclass(ApiLayoutDetector, BaseLayoutDetector)

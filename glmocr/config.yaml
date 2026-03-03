@@ -185,6 +185,36 @@ pipeline:
 
   # Layout detection settings (used when enable_layout=true)
   layout:
+    # -----------------------------------------------------------------------
+    # Backend selection
+    # -----------------------------------------------------------------------
+    # "local" (default): run PP-DocLayoutV3 in-process via HuggingFace
+    #   Requires: pip install 'glmocr[local]'
+    #   GPU strongly recommended.
+    #
+    # "api": delegate layout detection to a remote HTTP service
+    #   No GPU or HuggingFace installation required locally.
+    #   The remote service can be a FastAPI app in Docker; see:
+    #     glmocr/layout/api_layout_detector.py for the expected contract.
+    #   Corresponding env vars:
+    #     GLMOCR_LAYOUT_BACKEND=api
+    #     GLMOCR_LAYOUT_API_URL=http://my-layout-service:8010/layout
+    #     GLMOCR_LAYOUT_API_KEY=<optional-bearer-token>
+    backend: local
+
+    # -----------------------------------------------------------------------
+    # API backend settings  (only used when backend=api)
+    # -----------------------------------------------------------------------
+    api:
+      api_url: http://localhost:8010/layout
+      api_key: null        # optional Bearer token
+      connect_timeout: 30
+      request_timeout: 120
+      verify_ssl: false
+
+    # -----------------------------------------------------------------------
+    # Local backend settings  (only used when backend=local)
+    # -----------------------------------------------------------------------
     # PP-DocLayoutV3 model directory
     # Can be a local folder or a Hugging Face model id
     # (Use *_safetensors for Transformers; PaddlePaddle/PP-DocLayoutV3 is a PaddleOCR export)

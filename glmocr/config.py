@@ -46,8 +46,13 @@ _ENV_MAP: Dict[str, str] = {
     "OCR_MODEL": "pipeline.ocr_api.model",
     # Layout
     "ENABLE_LAYOUT": "pipeline.enable_layout",
+    # Layout backend: "local" (HuggingFace, default) or "api" (remote service)
+    "LAYOUT_BACKEND": "pipeline.layout.backend",
     # Allow overriding which GPU(s) the layout model uses
     "LAYOUT_CUDA_VISIBLE_DEVICES": "pipeline.layout.cuda_visible_devices",
+    # Layout API service (used when LAYOUT_BACKEND=api)
+    "LAYOUT_API_URL": "pipeline.layout.api.api_url",
+    "LAYOUT_API_KEY": "pipeline.layout.api.api_key",
     # Logging
     "LOG_LEVEL": "logging.level",
 }
@@ -177,7 +182,39 @@ class ResultFormatterConfig(_BaseConfig):
     label_visualization_mapping: Dict[str, Any] = Field(default_factory=dict)
 
 
+class LayoutApiConfig(_BaseConfig):
+    """Configuration for an external API-based layout detection service.
+
+    When ``pipeline.layout.backend`` is set to ``"api"``, the pipeline sends
+    images to this service instead of running the HuggingFace model in-process.
+    This allows the heavy torch/transformers dependencies to remain optional
+    (``pip install 'glmocr[local]'``) and lets the layout model run in a
+    separate Docker container (e.g. a FastAPI deployment).
+
+    The remote service must accept a POST request with JSON body::
+
+        {"images": ["<base64-encoded-PNG>", ...]}
+
+    and return::
+
+        {"results": [[{"index": 0, "label": "text", "score": 0.9,
+                       "bbox_2d": [x1, y1, x2, y2],
+                       "polygon": [[x, y], ...],
+                       "task_type": "text"}, ...], ...]}
+    """
+
+    api_url: str = "http://localhost:8010/layout"
+    api_key: Optional[str] = None
+    connect_timeout: int = 30
+    request_timeout: int = 120
+    verify_ssl: bool = False
+
+
 class LayoutConfig(_BaseConfig):
+    # Which backend to use: "local" (in-process HuggingFace) or "api" (remote service).
+    backend: str = "local"
+
+    # Settings for the local (in-process) backend.
     model_dir: Optional[str] = None
     threshold: float = 0.4
     threshold_by_class: Optional[Dict[Union[int, str], float]] = None
@@ -189,6 +226,9 @@ class LayoutConfig(_BaseConfig):
     layout_unclip_ratio: Optional[Any] = None
     layout_merge_bboxes_mode: Union[str, Dict[int, str]] = "large"
     label_task_mapping: Optional[Dict[str, Any]] = None
+
+    # Settings for the API backend.
+    api: LayoutApiConfig = Field(default_factory=LayoutApiConfig)
 
 
 class PipelineConfig(_BaseConfig):
@@ -367,6 +407,10 @@ class GlmOcrConfig(_BaseConfig):
             "ocr_api_port": "pipeline.ocr_api.api_port",
             # Layout GPU binding
             "cuda_visible_devices": "pipeline.layout.cuda_visible_devices",
+            # Layout backend and API settings
+            "layout_backend": "pipeline.layout.backend",
+            "layout_api_url": "pipeline.layout.api.api_url",
+            "layout_api_key": "pipeline.layout.api.api_key",
         }
         for kw, dotted in _KW_MAP.items():
             if kw in overrides and overrides[kw] is not None:

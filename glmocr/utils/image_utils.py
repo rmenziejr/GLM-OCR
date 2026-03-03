@@ -1,13 +1,20 @@
 """Image processing utilities."""
 
 import io
-import cv2
 import base64
 import math
 from io import BytesIO
 
 import numpy as np
 from PIL import Image
+
+try:
+    import cv2 as _cv2
+
+    CV2_AVAILABLE = True
+except ImportError:
+    _cv2 = None  # type: ignore
+    CV2_AVAILABLE = False
 
 
 def smart_resize(
@@ -221,14 +228,19 @@ def crop_image_region(image, bbox_2d, polygon=None, fill_color=255):
 
     # Create mask
     mask = np.zeros((crop_height, crop_width), dtype=np.uint8)
-    cv2.fillPoly(mask, [polygon_pixels], 1)
+    if not CV2_AVAILABLE:
+        raise ImportError(
+            "crop_image_region with polygon masking requires opencv-python. "
+            "Install with: pip install 'glmocr[local]'"
+        )
+    _cv2.fillPoly(mask, [polygon_pixels], 1)
 
     # Create output image with fill_color
     if len(img_crop.shape) == 3:
         output = np.full_like(img_crop, fill_color, dtype=np.uint8)
     else:
         output = np.full((crop_height, crop_width), fill_color, dtype=np.uint8)
-    cv2.copyTo(img_crop, mask, output)
+    _cv2.copyTo(img_crop, mask, output)
 
     # Convert back to PIL Image
     return Image.fromarray(output)

@@ -4,7 +4,14 @@ from typing import List, Dict, Tuple
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import os
-import cv2
+
+try:
+    import cv2 as _cv2
+
+    CV2_AVAILABLE = True
+except ImportError:
+    _cv2 = None  # type: ignore
+    CV2_AVAILABLE = False
 
 
 def get_colormap(rgb: bool = True) -> List[Tuple[int, int, int]]:
@@ -181,7 +188,19 @@ def _draw_polygon_masks(
         mask = np.zeros((img_height, img_width), dtype=np.uint8)
         polygon = np.array(polygon_points, dtype=np.int32)
         polygon = polygon.reshape((-1, 1, 2))
-        cv2.fillPoly(mask, [polygon], 1)
+        if not CV2_AVAILABLE:
+            # cv2 unavailable; skip polygon fill (visualization will be incomplete).
+            # Install with: pip install 'glmocr[local]'
+            import warnings
+
+            warnings.warn(
+                "opencv-python is not installed; polygon fill in layout visualization "
+                "will be skipped. Install with: pip install 'glmocr[local]'",
+                ImportWarning,
+                stacklevel=2,
+            )
+            continue
+        _cv2.fillPoly(mask, [polygon], 1)
 
         # Apply alpha blending
         idx = np.nonzero(mask)

@@ -1,6 +1,7 @@
 """Layout detection module."""
 
 from .base import BaseLayoutDetector
+from .api_layout_detector import ApiLayoutDetector
 
 from typing import Optional
 
@@ -26,7 +27,7 @@ def _raise_layout_import_error() -> None:
     if _layout_import_error_is_dependency:
         message = (
             "Layout detector dependencies are missing or incompatible. "
-            "Try: pip install 'glmocr[layout]'. "
+            "Try: pip install 'glmocr[local]'. "
             f"Original error: {type(_layout_import_error).__name__}: {_layout_import_error}"
         )
     else:
@@ -39,4 +40,4 @@ def _raise_layout_import_error() -> None:
     raise ImportError(message) from _layout_import_error
 
 
-__all__ = ["BaseLayoutDetector", "PPDocLayoutDetector"]
+__all__ = ["BaseLayoutDetector", "ApiLayoutDetector", "PPDocLayoutDetector"]

@@ -75,6 +75,10 @@ class GlmOcr:
         ocr_api_host: Optional[str] = None,
         ocr_api_port: Optional[int] = None,
         cuda_visible_devices: Optional[str] = None,
+        # Layout backend selection
+        layout_backend: Optional[str] = None,
+        layout_api_url: Optional[str] = None,
+        layout_api_key: Optional[str] = None,
     ):
         """Initialize GlmOcr.
 
@@ -92,6 +96,12 @@ class GlmOcr:
             timeout:  Request timeout in seconds.
             enable_layout: Whether to run layout detection.
             log_level: Logging level (DEBUG, INFO, WARNING, ERROR).
+            layout_backend: Layout detector backend – ``"local"`` (default,
+                requires ``pip install 'glmocr[local]'``) or ``"api"``
+                (delegates to a remote layout service, no GPU required).
+            layout_api_url: URL of the remote layout detection service
+                (used when ``layout_backend="api"``).
+            layout_api_key: Optional Bearer token for the layout API.
         """
         # If user provides api_key but no explicit mode, default to MaaS.
         if api_key is not None and mode is None:
@@ -110,6 +120,9 @@ class GlmOcr:
             ocr_api_host=ocr_api_host,
             ocr_api_port=ocr_api_port,
             cuda_visible_devices=cuda_visible_devices,
+            layout_backend=layout_backend,
+            layout_api_url=layout_api_url,
+            layout_api_key=layout_api_key,
         )
         # Apply logging config for API/SDK usage.
         ensure_logging_configured(
