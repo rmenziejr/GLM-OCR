@@ -1,0 +1,46 @@
+# Root-level .dockerignore — applies to all Docker builds from this directory.
+# (Docker reads .dockerignore from the build context root only.)
+
+# Git / CI
+.git
+.github
+.gitignore
+.pre-commit-config.yaml
+
+# Editor / IDE
+.vscode
+.idea
+.DS_Store
+*.swp
+*.swo
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Build / packaging artefacts
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Test output
+htmlcov/
+.coverage
+coverage.xml
+
+# Front-end build
+apps/frontend/node_modules/
+apps/frontend/dist/
+
+# Large data / output directories that are never needed inside the image
+data/
+output/
+images/
+*.db
+logs/
