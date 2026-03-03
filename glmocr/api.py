@@ -8,17 +8,23 @@ Two modes are supported:
 2. Self-hosted Mode (maas.enabled=false): Uses local vLLM/SGLang service.
    Requires GPU; SDK handles layout detection, parallel OCR, etc.
 
+Supported input types: file paths (``str``), ``pathlib.Path``, raw ``bytes``
+(image or PDF content), and URLs (file://, http://, data:).
+
 Agent-friendly usage::
 
-    # Only needs GLMOCR_API_KEY in environment (or pass api_key directly)
     from glmocr import GlmOcr
 
     parser = GlmOcr(api_key="sk-xxx", mode="maas")
-    results = parser.parse("document.png")
-    print(results[0].to_dict())
+    result = parser.parse("document.png")
+    result = parser.parse(open("doc.pdf", "rb").read())   # bytes
+    print(result.to_dict())
 """
 
+import os
 import re
+import shutil
+import tempfile
 from typing import Any, Dict, Generator, List, Literal, Optional, Union, overload
 from pathlib import Path
 
@@ -50,8 +56,10 @@ class GlmOcr:
         # --- Classic: YAML-based ---
         parser = glmocr.GlmOcr(config_path="config.yaml")
 
-        # --- Parse ---
-        results = parser.parse("image.png")
+        # --- Parse (paths, bytes, or mixed) ---
+        result = parser.parse("image.png")
+        result = parser.parse(open("doc.pdf", "rb").read())
+        results = parser.parse(["img.png", pdf_bytes])
         for r in results:
             print(r.markdown_result)
             print(r.to_dict())           # structured, JSON-serialisable
@@ -118,6 +126,7 @@ class GlmOcr:
         self._use_maas = self.config_model.pipeline.maas.enabled
         self._pipeline = None
         self._maas_client = None
+        self._session_temp_dir: Optional[str] = None
 
         if self._use_maas:
             # MaaS mode: use MaaSClient for direct API passthrough
@@ -134,10 +143,78 @@ class GlmOcr:
             self._pipeline.start()
             logger.info("GLM-OCR initialized in self-hosted mode")
 
+    # ------------------------------------------------------------------
+    # Input normalisation helpers
+    # ------------------------------------------------------------------
+
+    def _get_temp_dir(self) -> str:
+        if self._session_temp_dir is None:
+            self._session_temp_dir = tempfile.mkdtemp(prefix="glmocr_")
+        return self._session_temp_dir
+
+    @staticmethod
+    def _detect_suffix(data: bytes) -> str:
+        """Detect file extension from magic bytes."""
+        if data[:5] == b"%PDF-":
+            return ".pdf"
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return ".png"
+        if data[:2] == b"\xff\xd8":
+            return ".jpg"
+        if data[:4] == b"GIF8":
+            return ".gif"
+        if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return ".webp"
+        if data[:2] == b"BM":
+            return ".bmp"
+        return ".png"
+
+    def _bytes_to_temp_file(self, data: bytes) -> str:
+        """Write *data* to a temp file and return the path.
+
+        The file lives in ``_session_temp_dir`` and is cleaned up by
+        ``close()``.
+        """
+        suffix = self._detect_suffix(data)
+        fd, path = tempfile.mkstemp(suffix=suffix, dir=self._get_temp_dir())
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return path
+
+    def _to_url(self, image: Union[str, bytes, Path]) -> str:
+        """Convert any supported input to a ``file://`` or ``data:`` URL."""
+        if isinstance(image, bytes):
+            return f"file://{self._bytes_to_temp_file(image)}"
+        if isinstance(image, Path):
+            return f"file://{image.absolute()}"
+        if isinstance(image, str):
+            if image.startswith(("http://", "https://", "data:", "file://")):
+                return image
+            return f"file://{Path(image).absolute()}"
+        raise TypeError(f"Unsupported image type: {type(image)}")
+
+    @staticmethod
+    def _maas_source(image: Union[str, bytes, Path]):
+        """Return ``(source, display_name)`` suitable for the MaaS client."""
+        if isinstance(image, bytes):
+            return image, "<bytes>"
+        if isinstance(image, Path):
+            return str(image), str(image)
+        if isinstance(image, str) and image.startswith("file://"):
+            p = image[7:]
+            return p, p
+        return image, str(image)
+
+    # ------------------------------------------------------------------
+    # parse() and overloads
+    # ------------------------------------------------------------------
+
     @overload
     def parse(
         self,
-        images: str,
+        images: Union[str, bytes, Path],
         *,
         stream: Literal[False] = ...,
         save_layout_visualization: bool = ...,
@@ -148,7 +225,7 @@ class GlmOcr:
     @overload
     def parse(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         *,
         stream: Literal[False] = ...,
         save_layout_visualization: bool = ...,
@@ -159,7 +236,7 @@ class GlmOcr:
     @overload
     def parse(
         self,
-        images: Union[str, List[str]],
+        images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
         *,
         stream: Literal[True],
         save_layout_visualization: bool = ...,
@@ -169,7 +246,7 @@ class GlmOcr:
 
     def parse(
         self,
-        images: Union[str, List[str]],
+        images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
         *,
         stream: bool = False,
         save_layout_visualization: bool = True,
@@ -177,39 +254,36 @@ class GlmOcr:
     ) -> Union[
         PipelineResult, List[PipelineResult], Generator[PipelineResult, None, None]
     ]:
-        """Predict / parse images or documents.
+        """Parse images or documents.
 
-        Supports local paths and URLs (file://, http://, https://, data:).
-        Supports image files (jpg, png, bmp, gif, webp) and PDF files.
+        Accepts file paths, URLs, ``pathlib.Path`` objects, or raw ``bytes``
+        (image or PDF content).  Format is auto-detected from magic bytes.
 
         Args:
-            images: Image path/URL — a single ``str`` or a ``list`` of strings.
-            stream: If ``True``, yields one :class:`PipelineResult` at a time (avoids
-                holding all results in memory). If ``False``, returns a single result
-                or a list, depending on *images*.
+            images: A single input or a list.  Each element can be:
+
+                * ``str``   – local path or URL (file://, http://, data:)
+                * ``bytes`` – raw image / PDF bytes
+                * ``Path``  – ``pathlib.Path`` to a file
+
+            stream: If ``True``, yields one :class:`PipelineResult` at a time.
             save_layout_visualization: Whether to save layout visualization artifacts.
             **kwargs: Additional parameters for MaaS mode (return_crop_images,
                      need_layout_visualization, start_page_id, end_page_id, etc.)
 
         Returns:
-            - When ``stream=False`` (default): a single ``PipelineResult`` if *images*
-              is a ``str``, or a ``List[PipelineResult]`` if *images* is a list.
-            - When ``stream=True``: a generator that yields one ``PipelineResult``
-              per input.
+            - ``stream=False``, single input → ``PipelineResult``
+            - ``stream=False``, list input  → ``List[PipelineResult]``
+            - ``stream=True``               → ``Generator[PipelineResult, ...]``
 
-        Example:
-            # Single file — returns one PipelineResult
+        Examples::
+
             result = parser.parse("image.png")
-            result.save(output_dir="./output")
-
-            # Multiple files — returns a list
-            results = parser.parse(["img1.png", "doc.pdf"])
-
-            # Stream to avoid large in-memory results
-            for r in parser.parse(["a.pdf", "b.pdf"], stream=True):
-                r.save(output_dir="./output")
+            result = parser.parse(Path("image.png"))
+            result = parser.parse(open("image.png", "rb").read())
+            results = parser.parse(["img1.png", pdf_bytes])
         """
-        _single = isinstance(images, str)
+        _single = isinstance(images, (str, bytes, Path))
         if _single:
             images = [images]
 
@@ -225,7 +299,7 @@ class GlmOcr:
 
     def _parse_stream(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
         **kwargs: Any,
     ) -> Generator[PipelineResult, None, None]:
@@ -234,19 +308,17 @@ class GlmOcr:
             if save_layout_visualization:
                 kwargs.setdefault("need_layout_visualization", True)
             for image in images:
-                img = image
-                if img.startswith("file://"):
-                    img = img[7:]
+                source, display = self._maas_source(image)
                 try:
-                    response = self._maas_client.parse(img, **kwargs)
-                    result = self._maas_response_to_pipeline_result(response, img)
+                    response = self._maas_client.parse(source, **kwargs)
+                    result = self._maas_response_to_pipeline_result(response, display)
                     yield result
                 except Exception as e:
-                    logger.error("MaaS API error for %s: %s", img, e)
+                    logger.error("MaaS API error for %s: %s", display, e)
                     result = PipelineResult(
                         json_result=[],
                         markdown_result="",
-                        original_images=[img],
+                        original_images=[display],
                     )
                     result._error = str(e)
                     yield result
@@ -259,33 +331,28 @@ class GlmOcr:
 
     def _parse_maas(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> List[PipelineResult]:
         """Parse using MaaS API (passthrough mode)."""
         results = []
 
-        # Map save_layout_visualization to MaaS API parameter
         if save_layout_visualization:
             kwargs.setdefault("need_layout_visualization", True)
 
         for image in images:
-            # Resolve file:// URLs to actual paths
-            if image.startswith("file://"):
-                image = image[7:]
-
+            source, display = self._maas_source(image)
             try:
-                response = self._maas_client.parse(image, **kwargs)
-                result = self._maas_response_to_pipeline_result(response, image)
+                response = self._maas_client.parse(source, **kwargs)
+                result = self._maas_response_to_pipeline_result(response, display)
                 results.append(result)
             except Exception as e:
-                logger.error("MaaS API error for %s: %s", image, e)
-                # Return an error result
+                logger.error("MaaS API error for %s: %s", display, e)
                 result = PipelineResult(
                     json_result=[],
                     markdown_result="",
-                    original_images=[image],
+                    original_images=[display],
                 )
                 result._error = str(e)
                 results.append(result)
@@ -414,24 +481,25 @@ class GlmOcr:
 
         return result
 
-    def _parse_selfhosted(
-        self,
-        images: List[str],
-        save_layout_visualization: bool = True,
-    ) -> List[PipelineResult]:
-        """Parse using self-hosted vLLM/SGLang pipeline."""
-        import tempfile
-
-        messages = [{"role": "user", "content": []}]
+    def _build_selfhosted_request(
+        self, images: List[Union[str, bytes, Path]],
+    ) -> Dict[str, Any]:
+        """Build OpenAI-style request from mixed inputs."""
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": []}]
         for image in images:
-            if image.startswith(("http://", "https://", "data:", "file://")):
-                url = image
-            else:
-                url = f"file://{Path(image).absolute()}"
+            url = self._to_url(image)
             messages[0]["content"].append(
                 {"type": "image_url", "image_url": {"url": url}}
             )
-        request_data = {"messages": messages}
+        return {"messages": messages}
+
+    def _parse_selfhosted(
+        self,
+        images: List[Union[str, bytes, Path]],
+        save_layout_visualization: bool = True,
+    ) -> List[PipelineResult]:
+        """Parse using self-hosted vLLM/SGLang pipeline."""
+        request_data = self._build_selfhosted_request(images)
 
         layout_vis_dir = None
         if save_layout_visualization:
@@ -448,26 +516,11 @@ class GlmOcr:
 
     def _stream_parse_selfhosted(
         self,
-        images: List[str],
+        images: List[Union[str, bytes, Path]],
         save_layout_visualization: bool = True,
     ) -> Generator[PipelineResult, None, None]:
-        """Streaming variant of self-hosted parse().
-
-        Wraps ``Pipeline.process(...)`` and yields results as soon as they
-        become available from the async pipeline.
-        """
-        import tempfile
-
-        messages = [{"role": "user", "content": []}]
-        for image in images:
-            if image.startswith(("http://", "https://", "data:", "file://")):
-                url = image
-            else:
-                url = f"file://{Path(image).absolute()}"
-            messages[0]["content"].append(
-                {"type": "image_url", "image_url": {"url": url}}
-            )
-        request_data = {"messages": messages}
+        """Streaming variant of self-hosted parse()."""
+        request_data = self._build_selfhosted_request(images)
 
         layout_vis_dir = None
         if save_layout_visualization:
@@ -538,6 +591,9 @@ class GlmOcr:
         if self._maas_client:
             self._maas_client.stop()
             self._maas_client = None
+        if self._session_temp_dir:
+            shutil.rmtree(self._session_temp_dir, ignore_errors=True)
+            self._session_temp_dir = None
 
     def __enter__(self):
         """Context manager entry."""
@@ -558,7 +614,7 @@ class GlmOcr:
 # Convenience function
 @overload
 def parse(
-    images: str,
+    images: Union[str, bytes, Path],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
 ) -> PipelineResult:
@@ -567,7 +623,7 @@ def parse(
 
 @overload
 def parse(
-    images: List[str],
+    images: List[Union[str, bytes, Path]],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
 ) -> List[PipelineResult]:
@@ -576,7 +632,7 @@ def parse(
 
 @overload
 def parse(
-    images: Union[str, List[str]],
+    images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
     config_path: Optional[str] = ...,
     save_layout_visualization: bool = ...,
     *,
@@ -587,7 +643,7 @@ def parse(
 
 
 def parse(
-    images: Union[str, List[str]],
+    images: Union[str, bytes, Path, List[Union[str, bytes, Path]]],
     config_path: Optional[str] = None,
     save_layout_visualization: bool = True,
     *,
@@ -603,55 +659,30 @@ def parse(
     """Convenience function: parse images or documents in one call.
 
     Creates a :class:`GlmOcr` instance, runs parsing, and cleans up.
-    All keyword arguments are forwarded to the ``GlmOcr`` constructor.
 
     Examples::
 
         import glmocr
 
-        # Minimal – only needs GLMOCR_API_KEY env var
-        results = glmocr.parse("image.png")
+        result = glmocr.parse("image.png")
+        result = glmocr.parse(open("doc.pdf", "rb").read())
+        results = glmocr.parse(["img.png", pdf_bytes])
 
-        # Explicit API key
-        results = glmocr.parse("image.png", api_key="sk-xxx")
-
-        # Self-hosted mode
-        results = glmocr.parse("image.png", mode="selfhosted")
-
-        # Stream to avoid large in-memory results
         for r in glmocr.parse(["a.pdf", "b.pdf"], stream=True):
             r.save(output_dir="./output")
 
-    The return type mirrors the input type and stream:
-    - ``str``, stream=False → ``PipelineResult``
-    - ``List[str]``, stream=False → ``List[PipelineResult]``
-    - ``stream=True`` → ``Generator[PipelineResult, None, None]``
-
     Args:
-        images: Image path or URL (single ``str`` or ``List[str]``).
+        images: Single input or list.  Each element can be ``str`` (path/URL),
+            ``bytes`` (raw image/PDF), or ``pathlib.Path``.
         config_path: Config file path.
         save_layout_visualization: Whether to save layout visualization.
-        stream: If ``True``, returns a generator that yields one result at a time.
+        stream: If ``True``, returns a generator.
         api_key:  API key.
         api_url:  MaaS API endpoint URL.
         model:    Model name.
         mode:     ``"maas"`` or ``"selfhosted"``.
         timeout:  Request timeout in seconds.
         log_level: Logging level.
-
-    Returns:
-        A single ``PipelineResult``, a list, or a generator, depending on input and stream.
-
-    Example:
-        result = parse("image.png")
-        result.save(output_dir="./output")
-
-        results = parse(["img1.png", "doc.pdf"])
-        for r in results:
-            r.save(output_dir="./output")
-
-        for r in parse(["a.pdf", "b.pdf"], stream=True):
-            r.save(output_dir="./output")
     """
     with GlmOcr(
         config_path=config_path,
