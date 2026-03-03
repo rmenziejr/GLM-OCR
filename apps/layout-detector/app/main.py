@@ -211,7 +211,7 @@ def _batcher_loop() -> None:
                 offset += n
 
         except Exception as exc:  # noqa: BLE001
-            logger.error("Microbatch inference error: %s", exc)
+            logger.exception("Microbatch inference error: %s", exc)
             for req in pending:
                 if not req.future.done():
                     req.future.set_exception(exc)

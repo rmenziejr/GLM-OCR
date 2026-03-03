@@ -1810,13 +1810,13 @@ class TestMicrobatcher:
     """
 
     def _make_batcher_components(self, window_ms=50, max_images=8):
-        """Return a fresh (queue, stop_event, _batcher_loop) triple."""
+        """Return a fresh (queue, stop_event, batcher_loop, calls, _PendingRequest) tuple."""
         import concurrent.futures as cf
         import dataclasses
         import queue as _queue
         import threading
         import time
-        from typing import Any, Dict, List
+        from typing import List
         from PIL import Image
 
         @dataclasses.dataclass
