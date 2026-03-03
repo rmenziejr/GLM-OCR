@@ -1,0 +1,43 @@
+# Git / version control
+.git
+.github
+.gitignore
+.pre-commit-config.yaml
+
+# Editor / IDE artefacts
+.vscode
+.idea
+.DS_Store
+*.swp
+*.swo
+
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.mypy_cache/
+.pytest_cache/
+.hypothesis/
+
+# Build / packaging artefacts
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Test output
+htmlcov/
+.coverage
+coverage.xml
+
+# Other apps (not needed for this image)
+apps/backend/
+apps/frontend/
+
+# Large data / output directories
+data/
+output/
+images/
+*.db
+logs/
