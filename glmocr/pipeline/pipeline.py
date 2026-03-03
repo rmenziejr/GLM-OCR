@@ -109,14 +109,20 @@ class Pipeline:
             if layout_detector is not None:
                 self.layout_detector = layout_detector
             else:
-                from glmocr.layout import PPDocLayoutDetector
+                layout_backend = getattr(config.layout, "backend", "local")
+                if layout_backend == "api":
+                    from glmocr.layout import ApiLayoutDetector
 
-                if PPDocLayoutDetector is None:
-                    from glmocr.layout import _raise_layout_import_error
+                    self.layout_detector = ApiLayoutDetector(config.layout)
+                else:
+                    from glmocr.layout import PPDocLayoutDetector
 
-                    _raise_layout_import_error()
+                    if PPDocLayoutDetector is None:
+                        from glmocr.layout import _raise_layout_import_error
 
-                self.layout_detector = PPDocLayoutDetector(config.layout)
+                        _raise_layout_import_error()
+
+                    self.layout_detector = PPDocLayoutDetector(config.layout)
             self.max_workers = config.max_workers
         self._page_maxsize = getattr(config, "page_maxsize", 100)
         self._region_maxsize = getattr(config, "region_maxsize", 800)
