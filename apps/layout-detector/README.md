@@ -31,7 +31,7 @@ Detect layout regions in one or more images.
         "label": "text",
         "score": 0.91,
         "bbox_2d": [x1, y1, x2, y2],
-        "polygon": [[px, py], "..."],
+        "polygon": [[px, py], ...],
         "task_type": "text"
       }
     ]

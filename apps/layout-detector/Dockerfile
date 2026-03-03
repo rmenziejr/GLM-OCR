@@ -68,7 +68,7 @@ EXPOSE 8010
 # Allow extra time on first start for HuggingFace model download / GPU init.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
     CMD python -c \
-        "import urllib.request; urllib.request.urlopen('http://localhost:8010/health')" \
+        "import json, urllib.request, sys; resp = urllib.request.urlopen('http://localhost:8010/health'); data = json.load(resp); sys.exit(0 if isinstance(data, dict) and data.get('status') == 'healthy' else 1)" \
         || exit 1
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010"]
