@@ -1794,3 +1794,182 @@ class TestApiLayoutDetector:
         from glmocr.layout import ApiLayoutDetector, BaseLayoutDetector
 
         assert issubclass(ApiLayoutDetector, BaseLayoutDetector)
+
+
+class TestMicrobatcher:
+    """Unit tests for the layout-detector microbatch queue logic.
+
+    The batcher logic is tested here by reimplementing it as a local closure
+    that uses a mock ``fake_process`` instead of ``PPDocLayoutDetector``.  The
+    production module (``apps/layout-detector/app/main.py``) requires
+    ``fastapi``, ``PPDocLayoutDetector``, and other heavy dependencies that are
+    not available in the unit-test environment, so direct import is not
+    feasible.  These tests verify the algorithmic correctness of the
+    accumulation window, image-count cap, result slicing, and carry-over
+    behaviour.
+    """
+
+    def _make_batcher_components(self, window_ms=50, max_images=8):
+        """Return a fresh (queue, stop_event, batcher_loop, calls, _PendingRequest) tuple."""
+        import concurrent.futures as cf
+        import dataclasses
+        import queue as _queue
+        import threading
+        import time
+        from typing import List
+        from PIL import Image
+
+        @dataclasses.dataclass
+        class _PendingRequest:
+            pil_images: List[Image.Image]
+            future: cf.Future
+
+        request_queue: _queue.Queue = _queue.Queue()
+        stop_event = threading.Event()
+        calls: List[List[Image.Image]] = []
+
+        def fake_process(images):
+            calls.append(list(images))
+            return [[{"label": "text"}] for _ in images]
+
+        def batcher_loop():
+            carry_over = None
+            while not stop_event.is_set():
+                if carry_over is not None:
+                    first = carry_over
+                    carry_over = None
+                else:
+                    try:
+                        first = request_queue.get(timeout=0.05)
+                    except _queue.Empty:
+                        continue
+
+                pending = [first]
+                total_images = len(first.pil_images)
+                deadline = time.monotonic() + window_ms / 1000.0
+
+                while total_images < max_images:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        item = request_queue.get(timeout=max(0, remaining))
+                    except _queue.Empty:
+                        break
+
+                    new_total = total_images + len(item.pil_images)
+                    if new_total > max_images:
+                        carry_over = item
+                        break
+                    pending.append(item)
+                    total_images = new_total
+
+                all_images = [img for req in pending for img in req.pil_images]
+                try:
+                    all_results = fake_process(all_images)
+                    offset = 0
+                    for req in pending:
+                        n = len(req.pil_images)
+                        req.future.set_result(all_results[offset : offset + n])
+                        offset += n
+                except Exception as exc:
+                    for req in pending:
+                        if not req.future.done():
+                            req.future.set_exception(exc)
+
+        return request_queue, stop_event, batcher_loop, calls, _PendingRequest
+
+    def test_single_request_returns_correct_results(self):
+        """A single request gets its results back via its Future."""
+        import concurrent.futures as cf
+        import threading
+        from PIL import Image
+
+        rq, stop, loop, calls, PR = self._make_batcher_components()
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+        imgs = [Image.new("RGB", (10, 10)), Image.new("RGB", (10, 10))]
+        fut = cf.Future()
+        rq.put(PR(pil_images=imgs, future=fut))
+
+        results = fut.result(timeout=2)
+        stop.set()
+        t.join(timeout=1)
+
+        assert len(results) == 2
+        assert results[0] == [{"label": "text"}]
+
+    def test_multiple_concurrent_requests_batched_together(self):
+        """Two requests queued simultaneously are batched into one inference call."""
+        import concurrent.futures as cf
+        import threading
+        from PIL import Image
+
+        rq, stop, loop, calls, PR = self._make_batcher_components(window_ms=200)
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+        img = Image.new("RGB", (10, 10))
+        fut1, fut2 = cf.Future(), cf.Future()
+        rq.put(PR(pil_images=[img], future=fut1))
+        rq.put(PR(pil_images=[img], future=fut2))
+
+        r1 = fut1.result(timeout=2)
+        r2 = fut2.result(timeout=2)
+        stop.set()
+        t.join(timeout=1)
+
+        assert r1 == [[{"label": "text"}]]
+        assert r2 == [[{"label": "text"}]]
+        # Both requests should have been batched into a single process() call.
+        assert any(len(c) == 2 for c in calls), f"Expected a 2-image batch, got: {calls}"
+
+    def test_results_routed_to_correct_requester(self):
+        """Each Future receives only the slice of results for its own images."""
+        import concurrent.futures as cf
+        import threading
+        from PIL import Image
+
+        rq, stop, loop, calls, PR = self._make_batcher_components(window_ms=200)
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+        img = Image.new("RGB", (10, 10))
+        fut1, fut2 = cf.Future(), cf.Future()
+        rq.put(PR(pil_images=[img, img], future=fut1))  # 2 images
+        rq.put(PR(pil_images=[img], future=fut2))  # 1 image
+
+        r1 = fut1.result(timeout=2)
+        r2 = fut2.result(timeout=2)
+        stop.set()
+        t.join(timeout=1)
+
+        assert len(r1) == 2  # fut1 gets 2 result lists
+        assert len(r2) == 1  # fut2 gets 1 result list
+
+    def test_max_images_splits_into_separate_batches(self):
+        """When max_images is exceeded the overflow goes into a new batch."""
+        import concurrent.futures as cf
+        import threading
+        from PIL import Image
+
+        # max_images=2; three single-image requests should split across batches
+        rq, stop, loop, calls, PR = self._make_batcher_components(
+            window_ms=200, max_images=2
+        )
+        t = threading.Thread(target=loop, daemon=True)
+        t.start()
+
+        img = Image.new("RGB", (10, 10))
+        futs = [cf.Future() for _ in range(3)]
+        for fut in futs:
+            rq.put(PR(pil_images=[img], future=fut))
+
+        results = [f.result(timeout=2) for f in futs]
+        stop.set()
+        t.join(timeout=1)
+
+        assert all(r == [[{"label": "text"}]] for r in results)
+        # Each inference call must not exceed 2 images.
+        assert all(len(c) <= 2 for c in calls)
