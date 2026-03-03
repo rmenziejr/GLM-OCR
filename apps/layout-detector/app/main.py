@@ -11,6 +11,7 @@ Request::
 
     POST /layout
     Content-Type: application/json
+    Authorization: Bearer <token>   # required only when LAYOUT_API_KEY is set
 
     {"images": ["<base64-encoded-PNG>", ...]}
 
@@ -36,46 +37,71 @@ LAYOUT_CORS_ORIGINS
     Comma-separated list of allowed CORS origins.  Defaults to ``*`` (any
     origin), which is safe for container-to-container communication but should
     be tightened when the service is exposed to the public internet.
+LAYOUT_API_KEY
+    Optional shared secret.  When set, every request to ``POST /layout`` must
+    supply ``Authorization: Bearer <token>`` with a matching value.  Leave
+    unset to disable authentication (suitable for private networks).
 """
 
 from __future__ import annotations
 
 import base64
 import os
+import threading
 from contextlib import asynccontextmanager
 from io import BytesIO
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 from PIL import Image
 
 from glmocr.config import GlmOcrConfig
 from glmocr.layout.layout_detector import PPDocLayoutDetector
-from glmocr.utils.logging import get_logger
+from glmocr.utils.logging import ensure_logging_configured, get_logger
 
 logger = get_logger(__name__)
 
 # Module-level detector instance (set during lifespan startup).
 _detector: PPDocLayoutDetector | None = None
 
+# Serialises concurrent calls to _detector.process() so the single model
+# instance is never invoked from multiple threads simultaneously.
+_detect_lock = threading.Lock()
 
-def _build_layout_config():
-    """Return a :class:`~glmocr.config.LayoutConfig` ready for this service.
+# Optional API key read once at startup.
+_api_key: Optional[str] = os.environ.get("LAYOUT_API_KEY") or None
+
+_http_bearer = HTTPBearer(auto_error=False)
+
+
+def _verify_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_http_bearer),
+) -> None:
+    """Raise HTTP 401 when bearer-token authentication is enabled and fails."""
+    if _api_key is None:
+        return  # auth disabled
+    token = credentials.credentials if credentials else None
+    if token != _api_key:
+        raise HTTPException(status_code=401, detail="Invalid or missing bearer token.")
+
+
+def _build_full_config() -> GlmOcrConfig:
+    """Return a fully-loaded :class:`~glmocr.config.GlmOcrConfig`.
 
     Honours all ``GLMOCR_*`` environment variables plus the convenience
     variable ``LAYOUT_MODEL_DIR`` for overriding the model directory without
     touching the full config hierarchy.
     """
     cfg = GlmOcrConfig.from_env()
-    layout_cfg = cfg.pipeline.layout
 
     model_dir_env = os.environ.get("LAYOUT_MODEL_DIR")
     if model_dir_env:
-        layout_cfg.model_dir = model_dir_env
+        cfg.pipeline.layout.model_dir = model_dir_env
 
-    return layout_cfg
+    return cfg
 
 
 @asynccontextmanager
@@ -83,7 +109,15 @@ async def lifespan(app: FastAPI):
     """Load the model on startup and release it on shutdown."""
     global _detector
 
-    layout_cfg = _build_layout_config()
+    cfg = _build_full_config()
+
+    # Apply logging settings from config/env before anything else logs.
+    ensure_logging_configured(
+        level=cfg.logging.level,
+        format_string=cfg.logging.format,
+    )
+
+    layout_cfg = cfg.pipeline.layout
     logger.info("Loading PP-DocLayoutV3 from '%s' …", layout_cfg.model_dir)
     _detector = PPDocLayoutDetector(layout_cfg)
     _detector.start()
@@ -161,6 +195,7 @@ def health():
     "/layout",
     response_model=LayoutResponse,
     summary="Detect layout regions in one or more images",
+    dependencies=[Security(_verify_token)],
 )
 def detect_layout(request: LayoutRequest):
     """Decode base64 images and run PP-DocLayoutV3 layout detection.
@@ -182,5 +217,6 @@ def detect_layout(request: LayoutRequest):
                 detail=f"Failed to decode image at index {idx}: {exc}",
             ) from exc
 
-    results = _detector.process(pil_images)
+    with _detect_lock:
+        results = _detector.process(pil_images)
     return LayoutResponse(results=results)

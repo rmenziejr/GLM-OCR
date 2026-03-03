@@ -93,6 +93,7 @@ docker run -p 8010:8010 \
 | `GLMOCR_LAYOUT_CUDA_VISIBLE_DEVICES` | `"0"` | GPU device index; CPU is used automatically when CUDA is unavailable |
 | `GLMOCR_LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` |
 | `LAYOUT_CORS_ORIGINS` | `*` | Comma-separated list of allowed CORS origins; use specific domains in production (e.g. `https://app.example.com`) |
+| `LAYOUT_API_KEY` | *(unset)* | When set, every `POST /layout` request must supply `Authorization: Bearer <token>` with the same value.  Leave unset to disable auth (suitable for private networks). |
 
 All `GLMOCR_*` variables from the main SDK are also honoured — see
 [`glmocr/config.py`](../../glmocr/config.py) for the full list.
@@ -106,7 +107,7 @@ Set the following env vars (or update `config.yaml`) in the `glmocr` client:
 ```bash
 GLMOCR_LAYOUT_BACKEND=api
 GLMOCR_LAYOUT_API_URL=http://<container-host>:8010/layout
-# optional bearer token:
+# optional bearer token (must match LAYOUT_API_KEY set on the server):
 # GLMOCR_LAYOUT_API_KEY=<secret>
 ```
 

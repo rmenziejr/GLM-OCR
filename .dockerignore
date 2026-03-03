@@ -1,10 +1,13 @@
-# Git / version control
+# Root-level .dockerignore — applies to all Docker builds from this directory.
+# (Docker reads .dockerignore from the build context root only.)
+
+# Git / CI
 .git
 .github
 .gitignore
 .pre-commit-config.yaml
 
-# Editor / IDE artefacts
+# Editor / IDE
 .vscode
 .idea
 .DS_Store
@@ -31,11 +34,11 @@ htmlcov/
 .coverage
 coverage.xml
 
-# Other apps (not needed for this image)
-apps/backend/
-apps/frontend/
+# Front-end build
+apps/frontend/node_modules/
+apps/frontend/dist/
 
-# Large data / output directories
+# Large data / output directories that are never needed inside the image
 data/
 output/
 images/
