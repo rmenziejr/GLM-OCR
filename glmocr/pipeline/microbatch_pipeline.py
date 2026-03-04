@@ -1,31 +1,38 @@
 """GLM-OCR Microbatch Pipeline
 
-Multi-document pipeline with decoupled stages and shared microbatch queues.
+Async multi-document pipeline with decoupled stages and shared microbatch queues.
 
 Unlike the standard Pipeline (which processes one document request at a time),
 MicrobatchPipeline accepts a *list* of request payloads and routes pages from
 ALL documents through three shared, decoupled stage queues:
 
-    Stage 1 – Page loading (one loader thread per document):
-        Each document's pages are loaded concurrently.  Every page is tagged
-        with its (doc_index, page_index) and placed on a shared page_queue.
+    Stage 1 – Page loading (one coroutine per document):
+        Each document's pages are loaded concurrently via the default thread-pool
+        executor so that blocking I/O does not stall the event loop.  Every page is
+        tagged with its ``(doc_index, page_index)`` and placed on a shared async
+        ``page_queue``.
 
-    Stage 2 – Layout detection (single thread, microbatch-aware):
+    Stage 2 – Layout detection (single-thread executor, microbatch-aware):
         Consumes pages from all documents.  Accumulates up to
-        ``layout_detector.batch_size`` pages before running one GPU forward
-        pass.  Because pages from *different* documents share the same batch,
-        GPU utilisation stays high even when individual documents have few
-        pages.  Detected regions are pushed onto a shared region_queue.
+        ``layout_detector.batch_size`` pages before running one GPU forward pass,
+        which is offloaded to a dedicated single-thread ``ThreadPoolExecutor`` via
+        ``loop.run_in_executor`` — keeping GPU access serialised without blocking
+        the event loop.  Because pages from *different* documents share the same
+        batch, GPU utilisation stays high even when individual documents have few
+        pages.  Detected regions are pushed onto a shared async ``region_queue``.
 
-    Stage 3 – OCR recognition (thread pool):
-        Consumes layout regions concurrently with up to ``max_workers``
-        parallel API calls.  Results are assembled per-document.
+    Stage 3 – OCR recognition (httpx.AsyncClient + asyncio.Semaphore):
+        Consumes layout regions and fires one ``httpx`` async HTTP call per region.
+        Concurrency is bounded by ``max_workers`` via a semaphore.  All calls for a
+        batch run concurrently within the event loop — no thread pool required.
 
-Results are yielded per-document as soon as ALL of that document's regions
-have been recognised, so short documents do not wait for long ones.
+All three stages run as asyncio tasks.  Results are yielded per-document as soon
+as ALL of that document's regions have been recognised, so short documents do not
+wait for long ones.
 
 Example::
 
+    import asyncio
     from glmocr.config import load_config
     from glmocr.pipeline import MicrobatchPipeline
 
@@ -40,19 +47,31 @@ Example::
             "image_url": {"url": "file:///path/b.png"}}]}]},
     ]
 
-    for doc_idx, result in pipeline.process_batch(request_list):
-        result.save(output_dir=f"./output/{doc_idx}")
+    async def main():
+        async for doc_idx, result in pipeline.process_batch(request_list):
+            result.save(output_dir=f"./output/{doc_idx}")
 
+    asyncio.run(main())
     pipeline.stop()
 """
 
 from __future__ import annotations
 
-import queue
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Generator, List, Optional, Tuple
+import asyncio
+import functools
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
+
+import httpx
 
 from glmocr.parser_result import PipelineResult
 from glmocr.pipeline.pipeline import Pipeline
@@ -66,99 +85,76 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
-# Sentinel placed on queues to signal end-of-stream for a single producer.
-_DONE = object()
-
 
 @dataclass
-class _MicrobatchState:
-    """Shared mutable state wired through all three pipeline stages."""
+class _AsyncMicrobatchState:
+    """Shared mutable state wired through all three async pipeline stages.
 
-    # ---- queues --------------------------------------------------------
-    # Each item: ("page", doc_idx, page_idx, global_idx, pil_image)
-    #         or ("done_doc", doc_idx)          -- all pages of doc loaded
-    #         or ("done_all",)                  -- every loader finished
-    #         or ("error", doc_idx, exc)
-    page_queue: queue.Queue
+    No threading locks are needed because all mutations occur in asyncio
+    coroutines that run on the single-threaded event loop.  The layout
+    executor offloads the *blocking* GPU call to a thread, but state is
+    only mutated **after** ``await run_in_executor`` returns, which means
+    we are back on the event loop before touching any shared data.
+    """
 
-    # Each item: ("region", doc_idx, global_page_idx, cropped_img, region_dict, task_type)
-    #         or ("done",)
-    #         or ("error", exc)
-    region_queue: queue.Queue
-
-    # ---- per-document tracking -----------------------------------------
     num_docs: int
 
-    # Total pages loaded per doc (set when loader for that doc finishes).
-    pages_per_doc: List[Optional[int]]  # index = doc_idx
-    pages_per_doc_lock: threading.Lock
+    # Set to ``page_count`` once a doc's loader coroutine finishes.
+    pages_per_doc: List[Optional[int]]
 
     # layout_results[doc_idx][page_idx] = list of region dicts
     layout_results: List[Dict[int, List]]
-    layout_lock: threading.Lock
 
-    # Number of layout-detected regions per doc (known once all pages are laid out).
+    # Set to total region count once all pages for a doc have been laid out.
     regions_per_doc: List[Optional[int]]
-    regions_per_doc_lock: threading.Lock
 
-    # Recognition results: doc_idx → list of (global_page_idx, region_dict)
+    # recognition_results[doc_idx] = [(global_page_idx, region_dict), ...]
     recognition_results: List[List[Tuple[int, Dict]]]
-    recognition_lock: threading.Lock
 
-    # Ready queue – doc indices whose all regions have been recognised.
-    ready_queue: queue.Queue
-
-    # Track which docs have already been put on ready_queue.
+    # Tracks which docs have already been put on the ready_queue.
     docs_notified: set
-    docs_notified_lock: threading.Lock
 
-    # Exceptions from background threads.
-    exceptions: List[Tuple[str, Exception]]
-    exception_lock: threading.Lock
-
-    # images_dict: global_page_idx → PIL image (kept for layout visualisation)
+    # global_page_idx → PIL Image (kept for layout visualisation)
     images_dict: Dict[int, Any]
-    images_dict_lock: threading.Lock
 
-    # doc_idx → list of global_page_indices (in order)
+    # doc_idx → ordered list of global page indices
     doc_global_pages: List[List[int]]
 
+    # Exceptions raised in background tasks.
+    exceptions: List[Tuple[str, Exception]]
 
-def _make_state(num_docs: int, page_qsize: int, region_qsize: int) -> _MicrobatchState:
-    return _MicrobatchState(
-        page_queue=queue.Queue(maxsize=page_qsize),
-        region_queue=queue.Queue(maxsize=region_qsize),
+
+def _make_state(num_docs: int) -> _AsyncMicrobatchState:
+    return _AsyncMicrobatchState(
         num_docs=num_docs,
         pages_per_doc=[None] * num_docs,
-        pages_per_doc_lock=threading.Lock(),
         layout_results=[{} for _ in range(num_docs)],
-        layout_lock=threading.Lock(),
         regions_per_doc=[None] * num_docs,
-        regions_per_doc_lock=threading.Lock(),
         recognition_results=[[] for _ in range(num_docs)],
-        recognition_lock=threading.Lock(),
-        ready_queue=queue.Queue(),
         docs_notified=set(),
-        docs_notified_lock=threading.Lock(),
-        exceptions=[],
-        exception_lock=threading.Lock(),
         images_dict={},
-        images_dict_lock=threading.Lock(),
         doc_global_pages=[[] for _ in range(num_docs)],
+        exceptions=[],
     )
 
 
 class MicrobatchPipeline(Pipeline):
-    """Multi-document microbatch pipeline with decoupled stages.
+    """Multi-document microbatch pipeline with fully async stages.
 
-    Extends :class:`~glmocr.pipeline.Pipeline` with a
+    Extends :class:`~glmocr.pipeline.Pipeline` with an async
     :meth:`process_batch` method that accepts a *list* of request payloads
-    and routes pages from ALL documents through shared stage queues.
+    and routes pages from ALL documents through shared async stage queues.
 
-    The layout-detection stage accumulates pages from different documents into
-    a single GPU microbatch (up to ``layout_detector.batch_size`` pages), so
-    throughput scales with the total number of pages rather than the per-
-    document page count.
+    The three stages run as concurrent asyncio tasks:
+
+    * **Page loading** — one coroutine per document; blocking I/O offloaded
+      to the default thread-pool executor via ``loop.run_in_executor``.
+    * **Layout detection** — a single coroutine that accumulates pages into
+      microbatches and offloads each GPU forward pass to a dedicated
+      single-thread ``ThreadPoolExecutor``, keeping GPU access serialised
+      without blocking the event loop.
+    * **OCR recognition** — each region fires an async ``httpx`` HTTP call;
+      concurrency bounded by ``max_workers`` via ``asyncio.Semaphore``.
 
     Args:
         config: PipelineConfig instance.
@@ -188,21 +184,22 @@ class MicrobatchPipeline(Pipeline):
     # Public API
     # ------------------------------------------------------------------
 
-    def process_batch(
+    async def process_batch(
         self,
         request_data_list: List[Dict[str, Any]],
         save_layout_visualization: bool = False,
         layout_vis_output_dir: Optional[str] = None,
-    ) -> Generator[Tuple[int, PipelineResult], None, None]:
-        """Process a microbatch of documents through shared pipeline stages.
+    ) -> AsyncGenerator[Tuple[int, PipelineResult], None]:
+        """Process a microbatch of documents through shared async pipeline stages.
 
         Yields ``(doc_index, PipelineResult)`` tuples as each document
         completes.  Documents may complete out of order — shorter documents
         (fewer pages / regions) will typically finish first.
 
         When :attr:`enable_layout` is ``False`` each document is delegated to
-        :meth:`~glmocr.pipeline.Pipeline.process` serially and the tuple
-        ``(doc_index, result)`` is yielded in submission order.
+        the synchronous :meth:`~glmocr.pipeline.Pipeline.process` via the
+        default thread-pool executor, and the tuple ``(doc_index, result)``
+        is yielded in submission order.
 
         Args:
             request_data_list: List of request payloads, one per document.
@@ -216,24 +213,29 @@ class MicrobatchPipeline(Pipeline):
             return
 
         if not self.enable_layout:
-            # Fallback: delegate each doc to the standard single-doc pipeline.
+            loop = asyncio.get_event_loop()
             for doc_idx, req in enumerate(request_data_list):
-                for result in self.process(
-                    req,
-                    save_layout_visualization=save_layout_visualization,
-                    layout_vis_output_dir=layout_vis_output_dir,
-                ):
+                results = await loop.run_in_executor(
+                    None,
+                    lambda r=req: list(
+                        self.process(
+                            r,
+                            save_layout_visualization=save_layout_visualization,
+                            layout_vis_output_dir=layout_vis_output_dir,
+                        )
+                    ),
+                )
+                for result in results:
                     yield doc_idx, result
             return
 
         num_docs = len(request_data_list)
-        state = _make_state(
-            num_docs=num_docs,
-            page_qsize=self._page_qsize,
-            region_qsize=self._region_qsize,
-        )
+        state = _make_state(num_docs)
 
-        # Extract image URLs per doc.
+        page_queue: asyncio.Queue = asyncio.Queue(maxsize=self._page_qsize)
+        region_queue: asyncio.Queue = asyncio.Queue(maxsize=self._region_qsize)
+        ready_queue: asyncio.Queue = asyncio.Queue()
+
         image_urls_per_doc: List[List[str]] = [
             self._extract_image_urls(req) for req in request_data_list
         ]
@@ -242,99 +244,118 @@ class MicrobatchPipeline(Pipeline):
             for urls in image_urls_per_doc
         ]
 
-        # Global page index counter (shared across all loader threads).
+        # Monotonically increasing global page index — only mutated inside
+        # loader coroutines, which yield at `await` points between docs but
+        # never concurrently within a single doc's page loop.
         global_counter = [0]
-        global_counter_lock = threading.Lock()
+        loop = asyncio.get_event_loop()
 
         # ----------------------------------------------------------------
-        # Stage 1: Page loader threads (one per document)
+        # Helper: mark doc ready when all its regions are recognised
         # ----------------------------------------------------------------
 
-        loader_done_count = [0]
-        loader_done_lock = threading.Lock()
+        def _maybe_notify_ready(doc_idx: int) -> None:
+            expected = state.regions_per_doc[doc_idx]
+            if expected is None:
+                return
+            done = len(state.recognition_results[doc_idx])
+            if done >= expected and doc_idx not in state.docs_notified:
+                state.docs_notified.add(doc_idx)
+                ready_queue.put_nowait(doc_idx)
 
-        def _loader_for_doc(doc_idx: int) -> None:
+        # ----------------------------------------------------------------
+        # Stage 1: page loading (one coroutine per doc)
+        # ----------------------------------------------------------------
+
+        async def _load_doc(doc_idx: int) -> None:
             urls = image_urls_per_doc[doc_idx]
             page_count = 0
             try:
-                for page, _unit_idx in self.page_loader.iter_pages_with_unit_indices(
-                    urls
-                ):
-                    with global_counter_lock:
-                        g_idx = global_counter[0]
-                        global_counter[0] += 1
-                    with state.images_dict_lock:
-                        state.images_dict[g_idx] = page
+                pages = await loop.run_in_executor(
+                    None,
+                    lambda: list(
+                        self.page_loader.iter_pages_with_unit_indices(urls)
+                    ),
+                )
+                for page, _unit_idx in pages:
+                    g_idx = global_counter[0]
+                    global_counter[0] += 1
+                    state.images_dict[g_idx] = page
                     state.doc_global_pages[doc_idx].append(g_idx)
-                    state.page_queue.put(("page", doc_idx, page_count, g_idx, page))
+                    await page_queue.put(("page", doc_idx, page_count, g_idx, page))
                     page_count += 1
             except Exception as exc:
                 logger.exception(
                     "MicrobatchPipeline: loader error for doc %d: %s", doc_idx, exc
                 )
-                with state.exception_lock:
-                    state.exceptions.append((f"LoaderDoc{doc_idx}", exc))
-                state.page_queue.put(("error", doc_idx, exc))
+                state.exceptions.append((f"LoaderDoc{doc_idx}", exc))
+                await page_queue.put(("error", doc_idx, exc))
 
-            with state.pages_per_doc_lock:
-                state.pages_per_doc[doc_idx] = page_count
-            state.page_queue.put(("done_doc", doc_idx))
+            state.pages_per_doc[doc_idx] = page_count
+            await page_queue.put(("done_doc", doc_idx))
 
-            with loader_done_lock:
-                loader_done_count[0] += 1
-                if loader_done_count[0] == num_docs:
-                    state.page_queue.put(("done_all",))
-
-        loader_threads = [
-            threading.Thread(
-                target=_loader_for_doc, args=(i,), daemon=True, name=f"mb-loader-{i}"
-            )
-            for i in range(num_docs)
-        ]
+        async def _all_loaders() -> None:
+            await asyncio.gather(*[_load_doc(i) for i in range(num_docs)])
+            await page_queue.put(("done_all",))
 
         # ----------------------------------------------------------------
-        # Stage 2: Layout detection thread (microbatch across all docs)
+        # Stage 2: layout detection
+        #   – blocking GPU call offloaded to a dedicated single-thread
+        #     executor so the event loop stays responsive, and so that
+        #     concurrent GPU access is prevented.
         # ----------------------------------------------------------------
 
-        def _layout_thread() -> None:
+        layout_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="mb-layout"
+        )
+
+        async def _run_layout() -> None:
             batch_imgs: List[Any] = []
             batch_meta: List[Tuple[int, int, int]] = []  # (doc_idx, page_idx, g_idx)
-            all_loaders_done = False
             global_start_idx = 0
             docs_pages_received: Dict[int, int] = {i: 0 for i in range(num_docs)}
 
-            def _flush_batch() -> None:
+            async def _flush_batch() -> None:
                 nonlocal global_start_idx
                 if not batch_imgs:
                     return
+                imgs = list(batch_imgs)
+                meta = list(batch_meta)
+                batch_imgs.clear()
+                batch_meta.clear()
+
                 try:
-                    layout_results = self.layout_detector.process(
-                        batch_imgs,
-                        save_visualization=save_layout_visualization
-                        and layout_vis_output_dir is not None,
-                        visualization_output_dir=layout_vis_output_dir,
-                        global_start_idx=global_start_idx,
+                    layout_results = await loop.run_in_executor(
+                        layout_executor,
+                        functools.partial(
+                            self.layout_detector.process,
+                            imgs,
+                            save_visualization=(
+                                save_layout_visualization
+                                and layout_vis_output_dir is not None
+                            ),
+                            visualization_output_dir=layout_vis_output_dir,
+                            global_start_idx=global_start_idx,
+                        ),
                     )
                 except Exception as exc:
                     logger.exception(
                         "MicrobatchPipeline: layout detection error: %s", exc
                     )
-                    layout_results = [[] for _ in batch_imgs]
-                    with state.exception_lock:
-                        state.exceptions.append(("LayoutThread", exc))
+                    layout_results = [[] for _ in imgs]
+                    state.exceptions.append(("LayoutStage", exc))
 
-                global_start_idx += len(batch_imgs)
+                global_start_idx += len(imgs)
 
                 for (doc_idx, page_idx, g_idx), image, regions in zip(
-                    batch_meta, batch_imgs, layout_results
+                    meta, imgs, layout_results
                 ):
-                    with state.layout_lock:
-                        state.layout_results[doc_idx][page_idx] = regions
+                    state.layout_results[doc_idx][page_idx] = regions
                     for region in regions:
                         cropped = crop_image_region(
                             image, region["bbox_2d"], region["polygon"]
                         )
-                        state.region_queue.put(
+                        await region_queue.put(
                             (
                                 "region",
                                 doc_idx,
@@ -345,119 +366,88 @@ class MicrobatchPipeline(Pipeline):
                             )
                         )
 
-                batch_imgs.clear()
-                batch_meta.clear()
-
-            def _maybe_mark_doc_layout_done(doc_idx: int) -> None:
-                """Once all pages for a doc have been laid out, record total regions."""
-                with state.pages_per_doc_lock:
-                    expected = state.pages_per_doc[doc_idx]
+            def _maybe_mark_layout_done(doc_idx: int) -> None:
+                expected = state.pages_per_doc[doc_idx]
                 if expected is None:
                     return
                 if docs_pages_received[doc_idx] < expected:
                     return
-                with state.layout_lock:
-                    total_regions = sum(
-                        len(v)
-                        for v in state.layout_results[doc_idx].values()
-                    )
-                with state.regions_per_doc_lock:
-                    if state.regions_per_doc[doc_idx] is None:
-                        state.regions_per_doc[doc_idx] = total_regions
-                _maybe_notify_ready(doc_idx)
+                total_regions = sum(
+                    len(v) for v in state.layout_results[doc_idx].values()
+                )
+                if state.regions_per_doc[doc_idx] is None:
+                    state.regions_per_doc[doc_idx] = total_regions
+                    _maybe_notify_ready(doc_idx)
 
             try:
                 while True:
-                    try:
-                        item = state.page_queue.get(timeout=0.5)
-                    except queue.Empty:
-                        if all_loaders_done and batch_imgs:
-                            _flush_batch()
-                            for d in range(num_docs):
-                                _maybe_mark_doc_layout_done(d)
-                        continue
+                    item = await page_queue.get()
 
                     if item[0] == "page":
                         _, doc_idx, page_idx, g_idx, page = item
                         batch_imgs.append(page)
                         batch_meta.append((doc_idx, page_idx, g_idx))
-                        docs_pages_received[doc_idx] = (
-                            docs_pages_received[doc_idx] + 1
-                        )
+                        docs_pages_received[doc_idx] += 1
                         if len(batch_imgs) >= self.layout_detector.batch_size:
-                            docs_in_batch = set(m[0] for m in batch_meta)
-                            _flush_batch()
+                            docs_in_batch = {m[0] for m in batch_meta}
+                            await _flush_batch()
                             for d in docs_in_batch:
-                                _maybe_mark_doc_layout_done(d)
+                                _maybe_mark_layout_done(d)
 
                     elif item[0] == "done_doc":
                         _, doc_idx = item
-                        # Flush immediately to unblock recognition for this doc.
                         if batch_imgs:
-                            _flush_batch()
-                        _maybe_mark_doc_layout_done(doc_idx)
+                            await _flush_batch()
+                        _maybe_mark_layout_done(doc_idx)
 
                     elif item[0] == "done_all":
-                        all_loaders_done = True
                         if batch_imgs:
-                            _flush_batch()
+                            await _flush_batch()
                         for d in range(num_docs):
-                            _maybe_mark_doc_layout_done(d)
+                            _maybe_mark_layout_done(d)
                         break
 
                     elif item[0] == "error":
-                        # Loader failed for a doc; mark it as having 0 regions.
                         _, doc_idx, _exc = item
-                        with state.regions_per_doc_lock:
-                            if state.regions_per_doc[doc_idx] is None:
-                                state.regions_per_doc[doc_idx] = 0
+                        if state.regions_per_doc[doc_idx] is None:
+                            state.regions_per_doc[doc_idx] = 0
                         _maybe_notify_ready(doc_idx)
 
             except Exception as exc:
-                logger.exception("MicrobatchPipeline: layout thread error: %s", exc)
-                with state.exception_lock:
-                    state.exceptions.append(("LayoutThread", exc))
+                logger.exception(
+                    "MicrobatchPipeline: layout stage error: %s", exc
+                )
+                state.exceptions.append(("LayoutStage", exc))
             finally:
-                state.region_queue.put(("done",))
+                layout_executor.shutdown(wait=False)
+                await region_queue.put(("done",))
 
         # ----------------------------------------------------------------
-        # Helpers shared between layout and recognition threads
+        # Stage 3: OCR recognition
+        #   – each region fires a single httpx async HTTP request;
+        #     concurrency is bounded by max_workers via asyncio.Semaphore.
         # ----------------------------------------------------------------
 
-        def _maybe_notify_ready(doc_idx: int) -> None:
-            """Put doc_idx on ready_queue when all its regions are recognised."""
-            with state.regions_per_doc_lock:
-                expected = state.regions_per_doc[doc_idx]
-            if expected is None:
-                return
-            with state.recognition_lock:
-                done = len(state.recognition_results[doc_idx])
-            if done >= expected:
-                with state.docs_notified_lock:
-                    if doc_idx not in state.docs_notified:
-                        state.docs_notified.add(doc_idx)
-                        state.ready_queue.put(doc_idx)
+        async def _run_ocr() -> None:
+            semaphore = asyncio.Semaphore(min(self.max_workers, 128))
+            ocr_tasks: List[asyncio.Task] = []
 
-        # ----------------------------------------------------------------
-        # Stage 3: OCR recognition thread (thread pool)
-        # ----------------------------------------------------------------
-
-        def _recognition_thread() -> None:
-            executor = ThreadPoolExecutor(
-                max_workers=min(self.max_workers, 128),
-                thread_name_prefix="mb-ocr",
-            )
-            futures: Dict[Any, Tuple[int, int, Dict, str]] = {}
-            processing_complete = False
-            pending_skip: List[Tuple[int, int, Dict]] = []
-
-            def _harvest_done_futures() -> None:
-                for fut in list(futures.keys()):
-                    if not fut.done():
-                        continue
-                    doc_idx, g_idx, region, _task = futures.pop(fut)
+            async def _process_region(
+                doc_idx: int,
+                g_idx: int,
+                cropped: Any,
+                region: Dict,
+                task_type: str,
+                client: httpx.AsyncClient,
+            ) -> None:
+                async with semaphore:
+                    req = self.page_loader.build_request_from_image(
+                        cropped, task_type
+                    )
                     try:
-                        resp, status = fut.result()
+                        resp, status = await self.ocr_client.process_async(
+                            req, client
+                        )
                         if status == 200:
                             region["content"] = (
                                 resp["choices"][0]["message"]["content"].strip()
@@ -466,190 +456,147 @@ class MicrobatchPipeline(Pipeline):
                             region["content"] = ""
                     except Exception as exc:
                         logger.warning(
-                            "MicrobatchPipeline: recognition failed (doc=%d g_page=%d): %s",
+                            "MicrobatchPipeline: recognition failed "
+                            "(doc=%d g_page=%d): %s",
                             doc_idx,
                             g_idx,
                             exc,
                         )
                         region["content"] = ""
-                    with state.recognition_lock:
-                        state.recognition_results[doc_idx].append((g_idx, region))
-                    _maybe_notify_ready(doc_idx)
+                state.recognition_results[doc_idx].append((g_idx, region))
+                _maybe_notify_ready(doc_idx)
 
             try:
-                while True:
-                    _harvest_done_futures()
+                async with httpx.AsyncClient(
+                    verify=self.ocr_client.verify_ssl,
+                    timeout=self.ocr_client.request_timeout,
+                ) as client:
+                    while True:
+                        item = await region_queue.get()
 
-                    try:
-                        item = state.region_queue.get(timeout=0.02)
-                    except queue.Empty:
-                        if processing_complete and not futures:
-                            # Flush skipped regions.
-                            for doc_idx, g_idx, region in pending_skip:
+                        if item[0] == "region":
+                            _, doc_idx, g_idx, cropped, region, task_type = item
+                            if task_type == "skip":
                                 region["content"] = None
-                                with state.recognition_lock:
-                                    state.recognition_results[doc_idx].append(
-                                        (g_idx, region)
-                                    )
-                                _maybe_notify_ready(doc_idx)
-                            pending_skip.clear()
-                            break
-                        if futures and not processing_complete:
-                            try:
-                                next(as_completed(list(futures.keys()), timeout=0.05))
-                            except (StopIteration, TimeoutError):
-                                pass
-                        continue
-
-                    if item[0] == "region":
-                        _, doc_idx, g_idx, cropped, region, task_type = item
-                        if task_type == "skip":
-                            pending_skip.append((doc_idx, g_idx, region))
-                        else:
-                            req = self.page_loader.build_request_from_image(
-                                cropped, task_type
-                            )
-                            fut = executor.submit(self.ocr_client.process, req)
-                            futures[fut] = (doc_idx, g_idx, region, task_type)
-
-                    elif item[0] == "done":
-                        processing_complete = True
-
-                    elif item[0] == "error":
-                        break
-
-                # Drain any remaining futures.
-                if futures:
-                    for fut in as_completed(list(futures.keys())):
-                        doc_idx, g_idx, region, _task = futures.pop(fut)
-                        try:
-                            resp, status = fut.result()
-                            if status == 200:
-                                region["content"] = (
-                                    resp["choices"][0]["message"]["content"].strip()
+                                state.recognition_results[doc_idx].append(
+                                    (g_idx, region)
                                 )
+                                _maybe_notify_ready(doc_idx)
                             else:
-                                region["content"] = ""
-                        except Exception as exc:
-                            logger.warning(
-                                "MicrobatchPipeline: recognition failed (doc=%d): %s",
-                                doc_idx,
-                                exc,
-                            )
-                            region["content"] = ""
-                        with state.recognition_lock:
-                            state.recognition_results[doc_idx].append(
-                                (g_idx, region)
-                            )
-                        _maybe_notify_ready(doc_idx)
+                                task = asyncio.create_task(
+                                    _process_region(
+                                        doc_idx,
+                                        g_idx,
+                                        cropped,
+                                        region,
+                                        task_type,
+                                        client,
+                                    )
+                                )
+                                ocr_tasks.append(task)
+
+                        elif item[0] in ("done", "error"):
+                            break
+
+                    if ocr_tasks:
+                        task_results = await asyncio.gather(
+                            *ocr_tasks, return_exceptions=True
+                        )
+                        for exc in task_results:
+                            if isinstance(exc, Exception):
+                                logger.exception(
+                                    "MicrobatchPipeline: unexpected OCR task error: %s",
+                                    exc,
+                                )
+                                state.exceptions.append(("OCRStage", exc))
 
             except Exception as exc:
                 logger.exception(
-                    "MicrobatchPipeline: recognition thread error: %s", exc
+                    "MicrobatchPipeline: OCR stage error: %s", exc
                 )
-                with state.exception_lock:
-                    state.exceptions.append(("RecognitionThread", exc))
+                state.exceptions.append(("OCRStage", exc))
             finally:
-                executor.shutdown(wait=False)
                 # Ensure every doc gets notified even on error.
                 for d in range(num_docs):
-                    with state.docs_notified_lock:
-                        if d not in state.docs_notified:
-                            state.docs_notified.add(d)
-                            state.ready_queue.put(d)
+                    if d not in state.docs_notified:
+                        state.docs_notified.add(d)
+                        ready_queue.put_nowait(d)
 
         # ----------------------------------------------------------------
-        # Start threads
+        # Run all stages concurrently
         # ----------------------------------------------------------------
 
-        for t in loader_threads:
-            t.start()
+        pipeline_done = asyncio.Event()
 
-        t_layout = threading.Thread(
-            target=_layout_thread, daemon=True, name="mb-layout"
-        )
-        t_recog = threading.Thread(
-            target=_recognition_thread, daemon=True, name="mb-recognition"
-        )
-        t_layout.start()
-        t_recog.start()
+        async def _run_pipeline() -> None:
+            await asyncio.gather(
+                _all_loaders(),
+                _run_layout(),
+                _run_ocr(),
+                return_exceptions=True,
+            )
+            pipeline_done.set()
+
+        pipeline_task = asyncio.create_task(_run_pipeline())
 
         # ----------------------------------------------------------------
-        # Main thread: yield results as each doc becomes ready
+        # Main: yield results as each doc becomes ready
         # ----------------------------------------------------------------
 
-        emitted: set = set()
-        while len(emitted) < num_docs:
-            try:
-                doc_idx = state.ready_queue.get(timeout=1.0)
-            except queue.Empty:
-                # Check whether all threads are done (deadlock guard).
-                if (
-                    not t_layout.is_alive()
-                    and not t_recog.is_alive()
-                    and all(not t.is_alive() for t in loader_threads)
-                ):
-                    # Force remaining docs ready.
-                    for d in range(num_docs):
-                        if d not in emitted:
-                            with state.docs_notified_lock:
-                                if d not in state.docs_notified:
-                                    state.docs_notified.add(d)
-                            state.ready_queue.put(d)
-                continue
-
-            if doc_idx in emitted:
-                continue
-
-            # Verify all regions are truly available (guard against spurious wakeup).
-            with state.regions_per_doc_lock:
-                expected = state.regions_per_doc[doc_idx]
-            if expected is not None:
-                with state.recognition_lock:
-                    done = len(state.recognition_results[doc_idx])
-                if done < expected:
-                    # Re-enqueue and wait for more results.
-                    with state.docs_notified_lock:
-                        state.docs_notified.discard(doc_idx)
-                    state.ready_queue.put(doc_idx)
-                    continue
-
-            # Assemble per-doc result.
+        def _assemble_result(doc_idx: int) -> PipelineResult:
             g_pages = state.doc_global_pages[doc_idx]
             g_page_set = set(g_pages)
-            with state.recognition_lock:
-                doc_rec = [
-                    (g, r)
-                    for g, r in state.recognition_results[doc_idx]
-                    if g in g_page_set
-                ]
-
-            # Group regions by global page index, in page order.
-            g_to_page_pos = {g: pos for pos, g in enumerate(g_pages)}
+            doc_rec = [
+                (g, r)
+                for g, r in state.recognition_results[doc_idx]
+                if g in g_page_set
+            ]
+            g_to_pos = {g: pos for pos, g in enumerate(g_pages)}
             grouped: List[List[Dict]] = [[] for _ in g_pages]
             for g_idx, region in doc_rec:
-                pos = g_to_page_pos.get(g_idx)
+                pos = g_to_pos.get(g_idx)
                 if pos is not None:
                     grouped[pos].append(region)
-
             json_result, md_result = self.result_formatter.process(grouped)
-            yield doc_idx, PipelineResult(
+            return PipelineResult(
                 json_result=json_result,
                 markdown_result=md_result,
                 original_images=original_inputs[doc_idx],
                 layout_vis_dir=layout_vis_output_dir,
                 layout_image_indices=list(g_pages),
             )
+
+        emitted: set = set()
+        while len(emitted) < num_docs:
+            try:
+                doc_idx = await asyncio.wait_for(ready_queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if pipeline_done.is_set():
+                    # Force any remaining docs ready to avoid a deadlock.
+                    for d in range(num_docs):
+                        if d not in emitted:
+                            state.docs_notified.add(d)
+                            ready_queue.put_nowait(d)
+                continue
+
+            if doc_idx in emitted:
+                continue
+
+            # Guard: verify all regions are truly available before yielding.
+            expected = state.regions_per_doc[doc_idx]
+            if expected is not None:
+                done = len(state.recognition_results[doc_idx])
+                if done < expected:
+                    state.docs_notified.discard(doc_idx)
+                    ready_queue.put_nowait(doc_idx)
+                    continue
+
             emitted.add(doc_idx)
+            yield doc_idx, _assemble_result(doc_idx)
 
-        # Wait for all threads to finish, then surface any errors.
-        for t in loader_threads:
-            t.join()
-        t_layout.join()
-        t_recog.join()
+        await pipeline_task
 
-        with state.exception_lock:
-            if state.exceptions:
-                raise RuntimeError(
-                    "; ".join(f"{name}: {exc}" for name, exc in state.exceptions)
-                )
+        if state.exceptions:
+            raise RuntimeError(
+                "; ".join(f"{name}: {exc}" for name, exc in state.exceptions)
+            )

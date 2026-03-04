@@ -258,16 +258,24 @@ class TestMicrobatchPipeline:
 
     def test_process_batch_empty_list(self):
         """process_batch with an empty list yields nothing."""
+        import asyncio
         from glmocr.pipeline import MicrobatchPipeline
+
+        async def _collect():
+            results = []
+            async for item in p.process_batch([]):
+                results.append(item)
+            return results
 
         with patch.object(MicrobatchPipeline, "__init__", return_value=None):
             p = MicrobatchPipeline.__new__(MicrobatchPipeline)
             p.enable_layout = False
-            results = list(p.process_batch([]))
+            results = asyncio.run(_collect())
         assert results == []
 
     def test_process_batch_no_layout_delegates_to_process(self):
         """With enable_layout=False, process_batch delegates to Pipeline.process."""
+        import asyncio
         from glmocr.pipeline import MicrobatchPipeline
         from glmocr.parser_result import PipelineResult
 
@@ -276,6 +284,14 @@ class TestMicrobatchPipeline:
             markdown_result="hello",
             original_images=[],
         )
+
+        async def _collect(pipeline):
+            results = []
+            async for item in pipeline.process_batch(
+                [{"messages": []}, {"messages": []}]
+            ):
+                results.append(item)
+            return results
 
         with patch.object(MicrobatchPipeline, "__init__", return_value=None):
             p = MicrobatchPipeline.__new__(MicrobatchPipeline)
@@ -286,9 +302,7 @@ class TestMicrobatchPipeline:
                 "process",
                 side_effect=lambda *a, **kw: iter([fake_result]),
             ):
-                results = list(
-                    p.process_batch([{"messages": []}, {"messages": []}])
-                )
+                results = asyncio.run(_collect(p))
 
         # Two docs, one result each.
         assert len(results) == 2
@@ -299,7 +313,7 @@ class TestMicrobatchPipeline:
 
     def test_microbatch_pipeline_process_batch_yields_per_doc(self):
         """process_batch with layout enabled yields one result per document."""
-        import threading
+        import asyncio
         from PIL import Image
         from glmocr.pipeline import MicrobatchPipeline
         from glmocr.parser_result import PipelineResult
@@ -347,9 +361,12 @@ class TestMicrobatchPipeline:
 
         p.layout_detector = _MockLayoutDetector()
 
-        # --- mock ocr_client ---
+        # --- mock ocr_client (async process_async required) ---
         class _MockOcrClient:
-            def process(self, req):
+            verify_ssl = False
+            request_timeout = 30.0
+
+            async def process_async(self, req, client):
                 return (
                     {"choices": [{"message": {"content": "mock text"}}]},
                     200,
@@ -386,12 +403,18 @@ class TestMicrobatchPipeline:
             ]
         }
 
-        # Patch crop_image_region to avoid opencv dependency in tests.
-        with patch(
-            "glmocr.pipeline.microbatch_pipeline.crop_image_region",
-            side_effect=lambda img, bbox, poly=None: img,
-        ):
-            results = list(p.process_batch([req_a, req_b]))
+        async def _collect():
+            results = []
+            # Patch crop_image_region to avoid opencv dependency in tests.
+            with patch(
+                "glmocr.pipeline.microbatch_pipeline.crop_image_region",
+                side_effect=lambda img, bbox, poly=None: img,
+            ):
+                async for item in p.process_batch([req_a, req_b]):
+                    results.append(item)
+            return results
+
+        results = asyncio.run(_collect())
 
         assert len(results) == 2
         doc_indices = sorted(r[0] for r in results)
