@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import socket
@@ -9,6 +10,7 @@ import random
 from typing import TYPE_CHECKING, Dict, Tuple, Optional
 from urllib.parse import urlparse
 
+import httpx
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -375,6 +377,160 @@ class OCRClient:
             "error": f"API request failed after {total_attempts} attempts",
             "detail": last_error,
         }, 500
+
+    async def process_async(
+        self, request_data: Dict, client: "httpx.AsyncClient"
+    ) -> Tuple[Dict, int]:
+        """Async version of :meth:`process` using an ``httpx.AsyncClient``.
+
+        Mirrors all retry, back-off, and response-parsing logic of the
+        synchronous counterpart so callers get the same ``(response_dict,
+        status_code)`` contract.
+
+        Args:
+            request_data: Request payload (OpenAI / Ollama generate format).
+            client: A shared :class:`httpx.AsyncClient` instance managed by
+                the caller (e.g. via ``async with httpx.AsyncClient() as c``).
+
+        Returns:
+            ``(response_dict, http_status_code)``
+        """
+        if self.api_mode == "ollama_generate":
+            request_data = self._convert_to_ollama_generate(request_data)
+        else:
+            if self.model:
+                request_data["model"] = self.model
+
+        headers = {"Content-Type": "application/json", **self.extra_headers}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        total_attempts = int(self.retry_max_attempts) + 1
+        last_error: Optional[str] = None
+
+        for attempt in range(total_attempts):
+            try:
+                with profiler.measure("http_request"):
+                    response = await client.post(
+                        self.api_url,
+                        headers=headers,
+                        content=json.dumps(request_data).encode(),
+                        timeout=self.request_timeout,
+                    )
+
+                if response.status_code == 200:
+                    result = response.json()
+
+                    if self.api_mode == "ollama_generate":
+                        if "error" in result:
+                            error_msg = result.get("error", "Unknown error")
+                            logger.error("Ollama API returned error: %s", error_msg)
+                            return {"error": f"Ollama API error: {error_msg}"}, 500
+                        output = result.get("response")
+                        if output is None:
+                            logger.error(
+                                "Ollama API response missing 'response' field. Response: %s",
+                                str(result)[:500],
+                            )
+                            return {
+                                "error": "Invalid Ollama API response format: missing 'response' field"
+                            }, 500
+                    else:
+                        try:
+                            output = result["choices"][0]["message"]["content"]
+                        except (KeyError, IndexError, TypeError) as e:
+                            logger.error(
+                                "Invalid OpenAI API response format: %s. Response: %s",
+                                str(e),
+                                str(result)[:500],
+                            )
+                            return {
+                                "error": f"Invalid OpenAI API response format: {str(e)}"
+                            }, 500
+
+                    return {"choices": [{"message": {"content": output.strip()}}]}, 200
+
+                status = int(response.status_code)
+                body_preview = (response.text or "")[:500]
+
+                if status in self.retry_status_codes and attempt < total_attempts - 1:
+                    retry_after = self._parse_retry_after_seconds_httpx(response)
+                    logger.warning(
+                        "Received status %s from OCR API (attempt %d/%d). Retrying...",
+                        status,
+                        attempt + 1,
+                        total_attempts,
+                    )
+                    await self._async_sleep_backoff(
+                        attempt_index=attempt, retry_after_seconds=retry_after
+                    )
+                    continue
+
+                logger.warning(
+                    "Received bad status code: %s, response: %s",
+                    status,
+                    body_preview,
+                )
+                return {
+                    "error": "API request failed",
+                    "status_code": status,
+                    "response": body_preview,
+                }, status
+
+            except httpx.HTTPError as e:
+                last_error = str(e)
+                if attempt < total_attempts - 1:
+                    logger.warning(
+                        "OCR API request error (attempt %d/%d): %s. Retrying...",
+                        attempt + 1,
+                        total_attempts,
+                        last_error,
+                    )
+                    await self._async_sleep_backoff(attempt_index=attempt)
+                    continue
+                logger.error("Error during async recognition: %s", last_error)
+                return {"error": f"Error during recognition: {last_error}"}, 500
+
+            except Exception as e:
+                logger.error("Error during async recognition: %s", e)
+                return {"error": f"Error during recognition: {str(e)}"}, 500
+
+        return {
+            "error": f"API request failed after {total_attempts} attempts",
+            "detail": last_error,
+        }, 500
+
+    async def _async_sleep_backoff(
+        self, attempt_index: int, retry_after_seconds: Optional[float] = None
+    ) -> None:
+        """Async equivalent of :meth:`_sleep_backoff`."""
+        if retry_after_seconds is not None and retry_after_seconds > 0:
+            sleep_s = min(
+                float(retry_after_seconds), float(self.retry_backoff_max_seconds)
+            )
+        else:
+            base = float(self.retry_backoff_base_seconds)
+            sleep_s = min(
+                base * (2**attempt_index), float(self.retry_backoff_max_seconds)
+            )
+
+        jitter = sleep_s * float(self.retry_jitter_ratio)
+        if jitter > 0:
+            sleep_s = max(0.0, sleep_s + random.uniform(-jitter, jitter))
+
+        await asyncio.sleep(sleep_s)
+
+    @staticmethod
+    def _parse_retry_after_seconds_httpx(
+        response: "httpx.Response",
+    ) -> Optional[float]:
+        ra = response.headers.get("retry-after")
+        if not ra:
+            return None
+        try:
+            return float(ra)
+        except Exception:
+            return None
 
     def _convert_to_ollama_generate(self, request_data: Dict) -> Dict:
         """Convert OpenAI chat format to Ollama generate format.

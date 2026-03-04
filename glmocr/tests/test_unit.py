@@ -241,6 +241,189 @@ class TestPipeline:
             assert p.enable_layout is False
 
 
+class TestMicrobatchPipeline:
+    """Tests for MicrobatchPipeline (no external services required)."""
+
+    def test_import(self):
+        """MicrobatchPipeline can be imported from glmocr.pipeline."""
+        from glmocr.pipeline import MicrobatchPipeline
+
+        assert MicrobatchPipeline is not None
+
+    def test_is_subclass_of_pipeline(self):
+        """MicrobatchPipeline inherits from Pipeline."""
+        from glmocr.pipeline import MicrobatchPipeline, Pipeline
+
+        assert issubclass(MicrobatchPipeline, Pipeline)
+
+    def test_process_batch_empty_list(self):
+        """process_batch with an empty list yields nothing."""
+        import asyncio
+        from glmocr.pipeline import MicrobatchPipeline
+
+        async def _collect():
+            results = []
+            async for item in p.process_batch([]):
+                results.append(item)
+            return results
+
+        with patch.object(MicrobatchPipeline, "__init__", return_value=None):
+            p = MicrobatchPipeline.__new__(MicrobatchPipeline)
+            p.enable_layout = False
+            results = asyncio.run(_collect())
+        assert results == []
+
+    def test_process_batch_no_layout_delegates_to_process(self):
+        """With enable_layout=False, process_batch delegates to Pipeline.process."""
+        import asyncio
+        from glmocr.pipeline import MicrobatchPipeline
+        from glmocr.parser_result import PipelineResult
+
+        fake_result = PipelineResult(
+            json_result={},
+            markdown_result="hello",
+            original_images=[],
+        )
+
+        async def _collect(pipeline):
+            results = []
+            async for item in pipeline.process_batch(
+                [{"messages": []}, {"messages": []}]
+            ):
+                results.append(item)
+            return results
+
+        with patch.object(MicrobatchPipeline, "__init__", return_value=None):
+            p = MicrobatchPipeline.__new__(MicrobatchPipeline)
+            p.enable_layout = False
+            # side_effect returns a fresh iterator on each call
+            with patch.object(
+                MicrobatchPipeline,
+                "process",
+                side_effect=lambda *a, **kw: iter([fake_result]),
+            ):
+                results = asyncio.run(_collect(p))
+
+        # Two docs, one result each.
+        assert len(results) == 2
+        doc_indices = [r[0] for r in results]
+        assert sorted(doc_indices) == [0, 1]
+        for _, result in results:
+            assert result.markdown_result == "hello"
+
+    def test_microbatch_pipeline_process_batch_yields_per_doc(self):
+        """process_batch with layout enabled yields one result per document."""
+        import asyncio
+        from PIL import Image
+        from glmocr.pipeline import MicrobatchPipeline
+        from glmocr.parser_result import PipelineResult
+
+        # Build a minimal mock pipeline (no GPU / OCR service needed).
+        with patch.object(MicrobatchPipeline, "__init__", return_value=None):
+            p = MicrobatchPipeline.__new__(MicrobatchPipeline)
+
+        p.enable_layout = True
+        p._page_qsize = 50
+        p._region_qsize = 200
+        p.max_workers = 2
+
+        # --- mock page_loader ---
+        pil_image = Image.new("RGB", (100, 100))
+
+        class _MockPageLoader:
+            def iter_pages_with_unit_indices(self, urls):
+                for _ in urls:
+                    yield pil_image, 0
+
+            def build_request_from_image(self, img, task_type):
+                return {"task": task_type}
+
+        p.page_loader = _MockPageLoader()
+
+        # --- mock layout_detector ---
+        class _MockLayoutDetector:
+            batch_size = 2
+
+            def process(self, images, **kwargs):
+                return [
+                    [
+                        {
+                            "index": 0,
+                            "label": "text",
+                            "score": 0.9,
+                            "bbox_2d": [0, 0, 500, 500],
+                            "polygon": [[0, 0], [500, 0], [500, 500], [0, 500]],
+                            "task_type": "text",
+                        }
+                    ]
+                    for _ in images
+                ]
+
+        p.layout_detector = _MockLayoutDetector()
+
+        # --- mock ocr_client (async process_async required) ---
+        class _MockOcrClient:
+            verify_ssl = False
+            request_timeout = 30.0
+
+            async def process_async(self, req, client):
+                return (
+                    {"choices": [{"message": {"content": "mock text"}}]},
+                    200,
+                )
+
+        p.ocr_client = _MockOcrClient()
+
+        # --- mock result_formatter ---
+        class _MockResultFormatter:
+            def process(self, grouped):
+                return {"pages": len(grouped)}, "# mock"
+
+        p.result_formatter = _MockResultFormatter()
+
+        # Two single-image requests.
+        req_a = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "file:///a.png"}}
+                    ],
+                }
+            ]
+        }
+        req_b = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "file:///b.png"}}
+                    ],
+                }
+            ]
+        }
+
+        async def _collect():
+            results = []
+            # Patch crop_image_region to avoid opencv dependency in tests.
+            with patch(
+                "glmocr.pipeline.microbatch_pipeline.crop_image_region",
+                side_effect=lambda img, bbox, poly=None: img,
+            ):
+                async for item in p.process_batch([req_a, req_b]):
+                    results.append(item)
+            return results
+
+        results = asyncio.run(_collect())
+
+        assert len(results) == 2
+        doc_indices = sorted(r[0] for r in results)
+        assert doc_indices == [0, 1]
+        for _, pr in results:
+            assert isinstance(pr, PipelineResult)
+            assert pr.markdown_result == "# mock"
+
+
 class TestUtils:
     """Tests for utility functions."""
 
