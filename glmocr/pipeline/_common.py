@@ -2,29 +2,39 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Union
 
 from glmocr.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-def extract_image_urls(request_data: Dict[str, Any]) -> List[str]:
-    """Extract image URLs from an OpenAI-style request payload."""
-    image_urls: List[str] = []
+def extract_image_sources(request_data: Dict[str, Any]) -> List[Union[str, bytes]]:
+    """Extract image sources (URLs or raw bytes) from a request payload."""
+    sources: List[Union[str, bytes]] = []
     for msg in request_data.get("messages", []):
         if msg.get("role") == "user":
             contents = msg.get("content", [])
             if isinstance(contents, list):
                 for content in contents:
                     if content.get("type") == "image_url":
-                        image_urls.append(content["image_url"]["url"])
-    return image_urls
+                        sources.append(content["image_url"]["url"])
+                    elif content.get("type") == "image_bytes":
+                        sources.append(content["data"])
+    return sources
 
 
-def make_original_inputs(image_urls: List[str]) -> List[str]:
-    """Strip ``file://`` prefix so that original paths are returned."""
-    return [(url[7:] if url.startswith("file://") else url) for url in image_urls]
+def make_original_inputs(sources: List[Union[str, bytes]]) -> List[str]:
+    """Return display-friendly names for each input source."""
+    results: List[str] = []
+    for i, src in enumerate(sources):
+        if isinstance(src, bytes):
+            results.append(f"document_{i}")
+        elif src.startswith("file://"):
+            results.append(src[7:])
+        else:
+            results.append(src)
+    return results
 
 
 def extract_ocr_content(response: Dict[str, Any]) -> str:

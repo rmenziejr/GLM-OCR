@@ -21,10 +21,7 @@ Agent-friendly usage::
     print(result.to_dict())
 """
 
-import os
 import re
-import shutil
-import tempfile
 from typing import Any, Dict, Generator, List, Literal, Optional, Union, overload
 from pathlib import Path
 
@@ -129,7 +126,6 @@ class GlmOcr:
         self._use_maas = self.config_model.pipeline.maas.enabled
         self._pipeline = None
         self._maas_client = None
-        self._session_temp_dir: Optional[str] = None
 
         if self._use_maas:
             # MaaS mode: use MaaSClient for direct API passthrough
@@ -150,46 +146,9 @@ class GlmOcr:
     # Input normalisation helpers
     # ------------------------------------------------------------------
 
-    def _get_temp_dir(self) -> str:
-        if self._session_temp_dir is None:
-            self._session_temp_dir = tempfile.mkdtemp(prefix="glmocr_")
-        return self._session_temp_dir
-
     @staticmethod
-    def _detect_suffix(data: bytes) -> str:
-        """Detect file extension from magic bytes."""
-        if data[:5] == b"%PDF-":
-            return ".pdf"
-        if data[:8] == b"\x89PNG\r\n\x1a\n":
-            return ".png"
-        if data[:2] == b"\xff\xd8":
-            return ".jpg"
-        if data[:4] == b"GIF8":
-            return ".gif"
-        if len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
-            return ".webp"
-        if data[:2] == b"BM":
-            return ".bmp"
-        return ".png"
-
-    def _bytes_to_temp_file(self, data: bytes) -> str:
-        """Write *data* to a temp file and return the path.
-
-        The file lives in ``_session_temp_dir`` and is cleaned up by
-        ``close()``.
-        """
-        suffix = self._detect_suffix(data)
-        fd, path = tempfile.mkstemp(suffix=suffix, dir=self._get_temp_dir())
-        try:
-            os.write(fd, data)
-        finally:
-            os.close(fd)
-        return path
-
-    def _to_url(self, image: Union[str, bytes, Path]) -> str:
-        """Convert any supported input to a ``file://`` or ``data:`` URL."""
-        if isinstance(image, bytes):
-            return f"file://{self._bytes_to_temp_file(image)}"
+    def _to_url(image: Union[str, Path]) -> str:
+        """Convert a path/URL to a ``file://`` URL."""
         if isinstance(image, Path):
             return f"file://{image.absolute()}"
         if isinstance(image, str):
@@ -492,13 +451,18 @@ class GlmOcr:
     def _build_selfhosted_request(
         self, images: List[Union[str, bytes, Path]],
     ) -> Dict[str, Any]:
-        """Build OpenAI-style request from mixed inputs."""
+        """Build request from mixed inputs (paths, URLs, or raw bytes)."""
         messages: List[Dict[str, Any]] = [{"role": "user", "content": []}]
         for image in images:
-            url = self._to_url(image)
-            messages[0]["content"].append(
-                {"type": "image_url", "image_url": {"url": url}}
-            )
+            if isinstance(image, bytes):
+                messages[0]["content"].append(
+                    {"type": "image_bytes", "data": image}
+                )
+            else:
+                url = self._to_url(image)
+                messages[0]["content"].append(
+                    {"type": "image_url", "image_url": {"url": url}}
+                )
         return {"messages": messages}
 
     def _parse_selfhosted(
@@ -587,9 +551,6 @@ class GlmOcr:
         if self._maas_client:
             self._maas_client.stop()
             self._maas_client = None
-        if self._session_temp_dir:
-            shutil.rmtree(self._session_temp_dir, ignore_errors=True)
-            self._session_temp_dir = None
 
     def __enter__(self):
         """Context manager entry."""

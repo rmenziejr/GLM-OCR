@@ -94,18 +94,19 @@ class PageLoader:
     # Page loading
     # =========================================================================
 
-    def load_pages(self, sources: Union[str, List[str]]) -> List[Image.Image]:
+    def load_pages(self, sources: Union[str, bytes, List[Union[str, bytes]]]) -> List[Image.Image]:
         """Load sources into a list of PIL Images.
 
-        Supports image files and PDFs (PDFs are expanded into multiple pages).
+        Supports image files, PDFs, and raw bytes (PDFs are expanded into
+        multiple pages).
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Returns:
             List[PIL.Image.Image]
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
 
         all_pages = []
@@ -116,21 +117,21 @@ class PageLoader:
         return all_pages
 
     def load_pages_with_unit_indices(
-        self, sources: Union[str, List[str]]
+        self, sources: Union[str, bytes, List[Union[str, bytes]]]
     ) -> Tuple[List[Image.Image], List[int]]:
         """Load sources into pages and return unit index per page.
 
-        Each input URL is one "unit". For a PDF, all its pages share the same
+        Each input is one "unit". For a PDF, all its pages share the same
         unit index. Used by streaming mode to yield one result per input unit.
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Returns:
             (all_pages, unit_indices) where unit_indices[i] is the unit index
-            of page i (i.e. which input URL it came from).
+            of page i (i.e. which input it came from).
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
 
         all_pages: List[Image.Image] = []
@@ -141,29 +142,36 @@ class PageLoader:
             unit_indices.extend([unit_idx] * len(pages))
         return all_pages, unit_indices
 
-    def iter_pages_with_unit_indices(self, sources: Union[str, List[str]]):
+    def iter_pages_with_unit_indices(self, sources: Union[str, bytes, List[Union[str, bytes]]]):
         """Stream pages one at a time with unit index per page.
 
         Yields (page, unit_idx) so the pipeline can enqueue each page as soon
         as it is rendered (e.g. PDF: render one page → yield → next page).
 
         Args:
-            sources: Single path/URL or a list.
+            sources: Single path/URL/bytes or a list.
 
         Yields:
             (PIL.Image, unit_idx) for each page.
         """
-        if isinstance(sources, str):
+        if isinstance(sources, (str, bytes)):
             sources = [sources]
         for unit_idx, source in enumerate(sources):
             try:
                 for page in self._iter_source(source):
                     yield page, unit_idx
             except Exception as e:
-                logger.warning("Skipping source '%s' (unit %d): %s", source, unit_idx, e)
+                logger.warning("Skipping source (unit %d): %s", unit_idx, e)
 
-    def _iter_source(self, source: str):
+    def _iter_source(self, source: Union[str, bytes]):
         """Yield pages from a single source one at a time."""
+        if isinstance(source, bytes):
+            if source[:5] == b"%PDF-":
+                yield from self._iter_pdf_bytes(source)
+            else:
+                yield Image.open(BytesIO(source))
+            return
+
         if source.startswith("file://"):
             file_path = source[7:]
         else:
@@ -198,11 +206,45 @@ class PageLoader:
         ):
             yield image
 
-    def _load_source(self, source: str) -> List[Image.Image]:
+    def _iter_pdf_bytes(self, data: bytes):
+        """Yield PDF pages from raw bytes one at a time."""
+        end_page = self._compute_end_page()
+        for image in pdf_to_images_pil_iter(
+            data,
+            dpi=self.pdf_dpi,
+            max_width_or_height=3500,
+            start_page_id=0,
+            end_page_id=end_page,
+        ):
+            yield image
+
+    def _load_pdf_bytes(self, data: bytes) -> List[Image.Image]:
+        """Load all pages from PDF bytes."""
+        t0 = time.perf_counter()
+        end_page = self._compute_end_page()
+        pages = pdf_to_images_pil(
+            data,
+            dpi=self.pdf_dpi,
+            max_width_or_height=3500,
+            start_page_id=0,
+            end_page_id=end_page,
+        )
+        profiler.log(
+            "pdf_to_images_pil(<bytes>)",
+            (time.perf_counter() - t0) * 1000,
+        )
+        return pages
+
+    def _load_source(self, source: Union[str, bytes]) -> List[Image.Image]:
         """Load a single source and return a list of pages.
 
         PDFs return all pages; images return a single-page list.
         """
+        if isinstance(source, bytes):
+            if source[:5] == b"%PDF-":
+                return self._load_pdf_bytes(source)
+            return [Image.open(BytesIO(source))]
+
         if source.startswith("file://"):
             file_path = source[7:]
         else:

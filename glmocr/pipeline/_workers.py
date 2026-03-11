@@ -50,9 +50,12 @@ logger = get_logger(__name__)
 def data_loading_worker(
     state: PipelineState,
     page_loader: "PageLoader",
-    image_urls: List[str],
+    image_sources: List[Any],
 ) -> None:
-    """Load pages from *image_urls* and push them onto ``state.page_queue``.
+    """Load pages from *image_sources* and push them onto ``state.page_queue``.
+
+    *image_sources* may contain file paths (str), ``file://`` URLs, or raw
+    ``bytes`` (image / PDF content).
 
     For each page that is loaded, ``state.register_page()`` is called
     **before** the page message is enqueued, so that the tracker's
@@ -67,13 +70,13 @@ def data_loading_worker(
     ``UNIT_DONE`` sentinel so the tracker can finalise them with
     ``region_count=0``.
     """
-    num_units = len(image_urls)
+    num_units = len(image_sources)
     page_idx = 0
     unit_indices_list: List[int] = []
     prev_unit_idx: Optional[int] = None
     sent_unit_done: set = set()
     try:
-        for page, unit_idx in page_loader.iter_pages_with_unit_indices(image_urls):
+        for page, unit_idx in page_loader.iter_pages_with_unit_indices(image_sources):
             if state.is_shutdown:
                 break
 

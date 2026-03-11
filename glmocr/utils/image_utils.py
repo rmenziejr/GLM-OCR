@@ -289,8 +289,15 @@ def _render_page_to_pil(page, dpi: int = 200, max_width_or_height: int = 3500):
     return image, scale
 
 
+def _open_pdf(source):
+    """Open a PDF from a file path (str) or raw bytes."""
+    if isinstance(source, bytes):
+        return fitz.open(stream=source, filetype="pdf")
+    return fitz.open(source)
+
+
 def pdf_to_images_pil(
-    pdf_path: str,
+    source,
     dpi: int = 200,
     max_width_or_height: int = 3500,
     start_page_id: int = 0,
@@ -299,7 +306,7 @@ def pdf_to_images_pil(
     """Convert PDF to list of PIL Images.
 
     Args:
-        pdf_path: PDF file path.
+        source: PDF file path (str) or raw PDF bytes.
         dpi: Render DPI.
         max_width_or_height: Max width or height.
         start_page_id: Start page index (0-based).
@@ -310,7 +317,7 @@ def pdf_to_images_pil(
     """
     doc = None
     try:
-        doc = fitz.open(pdf_path)
+        doc = _open_pdf(source)
         page_count = doc.page_count
         if end_page_id is None or end_page_id < 0:
             end_page_id = page_count - 1
@@ -330,7 +337,7 @@ def pdf_to_images_pil(
 
 
 def pdf_to_images_pil_iter(
-    pdf_path: str,
+    source,
     dpi: int = 200,
     max_width_or_height: int = 3500,
     start_page_id: int = 0,
@@ -342,7 +349,7 @@ def pdf_to_images_pil_iter(
     downstream can start processing before the whole PDF is loaded.
 
     Args:
-        pdf_path: PDF file path.
+        source: PDF file path (str) or raw PDF bytes.
         dpi: Render DPI.
         max_width_or_height: Max width or height.
         start_page_id: Start page index (0-based).
@@ -352,8 +359,9 @@ def pdf_to_images_pil_iter(
         PIL.Image per page.
     """
     doc = None
+    label = source if isinstance(source, str) else "<bytes>"
     try:
-        doc = fitz.open(pdf_path)
+        doc = _open_pdf(source)
         page_count = doc.page_count
         if end_page_id is None or end_page_id < 0:
             end_page_id = page_count - 1
@@ -363,7 +371,7 @@ def pdf_to_images_pil_iter(
             try:
                 page = doc.load_page(i)
             except Exception as e:
-                logger.warning("Skipping page %d of '%s': %s", i, pdf_path, e)
+                logger.warning("Skipping page %d of '%s': %s", i, label, e)
                 continue
             try:
                 image, _ = _render_page_to_pil(
@@ -371,7 +379,7 @@ def pdf_to_images_pil_iter(
                 )
                 yield image
             except Exception as e:
-                logger.warning("Skipping page %d of '%s' (render failed): %s", i, pdf_path, e)
+                logger.warning("Skipping page %d of '%s' (render failed): %s", i, label, e)
     finally:
         if doc is not None:
             doc.close()

@@ -25,7 +25,7 @@ from glmocr.parser_result import PipelineResult
 from glmocr.postprocess import ResultFormatter
 from glmocr.utils.logging import get_logger
 
-from glmocr.pipeline._common import extract_image_urls, extract_ocr_content, make_original_inputs
+from glmocr.pipeline._common import extract_image_sources, extract_ocr_content, make_original_inputs
 from glmocr.pipeline._state import PipelineState
 from glmocr.pipeline._workers import data_loading_worker, layout_worker, recognition_worker
 from glmocr.pipeline._unit_tracker import UnitTracker
@@ -116,14 +116,14 @@ class Pipeline:
         Yields:
             One ``PipelineResult`` per input URL (image or PDF).
         """
-        image_urls = extract_image_urls(request_data)
+        image_sources = extract_image_sources(request_data)
 
-        if not image_urls:
+        if not image_sources:
             yield self._process_passthrough(request_data)
             return
 
-        num_units = len(image_urls)
-        original_inputs = make_original_inputs(image_urls)
+        num_units = len(image_sources)
+        original_inputs = make_original_inputs(image_sources)
 
         state = PipelineState(
             page_maxsize=page_maxsize or self._page_maxsize,
@@ -136,7 +136,7 @@ class Pipeline:
 
         t1 = threading.Thread(
             target=data_loading_worker,
-            args=(state, self.page_loader, image_urls),
+            args=(state, self.page_loader, image_sources),
             daemon=True,
         )
         t2 = threading.Thread(
