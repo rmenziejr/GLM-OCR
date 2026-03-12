@@ -267,7 +267,18 @@ class ResultFormatter(BasePostProcessor):
         if content is None:
             return content
 
-        content = self._clean_content(str(content))
+        if label == "table":
+            if content.startswith("<table") and content.endswith("</table>"):
+                content = content.strip()
+            else:
+                content = self._clean_content(str(content))
+        elif label == "formula":
+            if content.startswith("$$") and content.endswith("$$"):
+                content = content.strip()
+            else:
+                content = self._clean_content(str(content))
+        else:
+            content = self._clean_content(str(content))
 
         # Title formatting
         if native_label == "doc_title":
@@ -283,20 +294,26 @@ class ResultFormatter(BasePostProcessor):
 
         # Formula formatting
         if label == "formula":
-            if content.startswith("$$") and content.endswith("$$"):
-                content = content[2:-2].strip()
-                content = "$$\n" + content + "\n$$"
-            elif content.startswith("\\[") and content.endswith("\\]"):
-                content = content[2:-2].strip()
-                content = "$$\n" + content + "\n$$"
-            elif content.startswith("\\(") and content.endswith("\\)"):
-                content = content[2:-2].strip()
-                content = "$$\n" + content + "\n$$"
-            else:
-                content = "$$\n" + content + "\n$$"
+            if (
+                content.startswith("$$") 
+                or content.startswith("\\[") 
+                or content.startswith("\\(")
+            ):
+                content = content[2:].strip()
+            if (
+                content.endswith("$$") 
+                or content.endswith("\\]") 
+                or content.endswith("\\)")
+            ):
+                content = content[:-2].strip()
+            content = "$$\n" + content + "\n$$"
 
         # Text formatting
         if label == "text":
+            # Code blocks
+            if content.startswith("```") and (not content.endswith("```")):
+                content = content + "\n```"
+
             # Bullet points
             if (
                 content.startswith("·")
