@@ -177,9 +177,9 @@ class ResultFormatter(BasePostProcessor):
                         result["native_label"],
                     )
 
-                    # Skip empty content (after formatting)
+                    # Skip empty or failed content (after formatting)
                     content = result.get("content")
-                    if isinstance(content, str) and content.strip() == "":
+                    if content is None or (isinstance(content, str) and content.strip() == ""):
                         continue
 
                     # Update index

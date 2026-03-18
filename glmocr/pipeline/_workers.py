@@ -382,10 +382,13 @@ def _handle_future_result(
             content = response["choices"][0]["message"]["content"]
             region["content"] = content.strip() if content else ""
         else:
-            region["content"] = ""
+            logger.warning(
+                "Recognition failed for page %d: HTTP %s", page_idx, status_code
+            )
+            region["content"] = None
     except Exception as e:
         logger.warning("Recognition failed for page %d: %s", page_idx, e)
-        region["content"] = ""
+        region["content"] = None
     state.add_recognition_result(page_idx, region)
 
 
