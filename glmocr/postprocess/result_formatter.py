@@ -132,7 +132,7 @@ class ResultFormatter(BasePostProcessor):
             markdown_parts.append(content)
 
         json_str = json.dumps(json_results, ensure_ascii=False)
-        markdown_str = "\n\n---\n\n".join(markdown_parts)
+        markdown_str = "\n\n<!-- Page Break -->\n\n".join(markdown_parts)
 
         return json_str, markdown_str
 
@@ -247,7 +247,7 @@ class ResultFormatter(BasePostProcessor):
 
         with profiler.measure("serialize_json"):
             json_str = json.dumps(json_final_results, ensure_ascii=False)
-        markdown_str = "\n\n".join(markdown_final_results)
+        markdown_str = "\n\n<!-- Page Break -->\n\n".join(markdown_final_results)
 
         return json_str, markdown_str, image_files
 
